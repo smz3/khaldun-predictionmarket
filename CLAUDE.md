@@ -7,7 +7,11 @@ infra (DB, handover, hooks) meant to be copied into other projects.
 
 - `.claude/state.db` (SQLite, gitignored, local-only) holds session handover
   notes. View it with the VS Code SQLite Viewer extension.
-- SessionStart hook auto-injects the last handover into context.
+- SessionStart hook auto-injects the latest handover from *each* session that
+  logged one in the last 24h (`HANDOVER_WINDOW_HOURS` in db.py), not just the
+  single most recent row repo-wide — deliberate, since multiple parallel
+  agent sessions can each finish and log around the same time, and an
+  overall-latest query would silently hide every session but the last writer.
 - Stop hook blocks once if no handover was logged this session — follow the
   command it prints (`.claude/scripts/db.py log --session ...`).
 - **`/handover`** — say this (or just ask to "wrap up") to end a session

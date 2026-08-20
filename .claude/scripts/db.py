@@ -3,6 +3,11 @@ Local state DB for session continuity. Stdlib only (sqlite3), no deps.
 
 Table: log(id, ts, session_id, type, content)
   type = 'session_start' | 'facts' | 'handover' | 'context_watch'
+  Handover rows are one-per-log-call, not one-per-session - a session can
+  log more than once. SessionStart surfaces the latest handover from EACH
+  session that logged one within HANDOVER_WINDOW_HOURS (not just the single
+  latest row repo-wide), so parallel agent sessions finishing around the
+  same time don't shadow each other's context.
 Table: sessions(session_id, started_ts, last_seen_ts)
   One row per session, updated in place. started_ts set once; last_seen_ts
   bumped on every session-start and stop-check call (a heartbeat, since
@@ -115,6 +120,13 @@ LIKELY_DEAD_GRACE_MINUTES = 3
 # deprioritize before piling on more, instead of letting the list bloat
 # silently.
 TODO_BLOAT_THRESHOLD = 6
+# SessionStart shows the latest handover from each session that logged one
+# within this window, not just the single latest row repo-wide - multiple
+# parallel agent sessions can each finish and log around the same time, and
+# a "latest overall" query would silently hide every session but the last
+# writer. Bounded so old finished work doesn't pile up in every future
+# SessionStart forever.
+HANDOVER_WINDOW_HOURS = 24
 
 
 def get_conn():
@@ -345,6 +357,46 @@ def cmd_init(_args):
     get_conn().close()
 
 
+def recent_handovers(conn, exclude_session_id, window_hours=HANDOVER_WINDOW_HOURS):
+    """Latest handover from each session (other than exclude_session_id) that
+    logged one within window_hours. Most-recent-session first. Returns a list
+    of (session_id, ts, parsed_content_dict).
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    rows = conn.execute(
+        "SELECT session_id, ts, content FROM log WHERE type = 'handover' AND ts >= ? "
+        "AND session_id != ? ORDER BY ts",
+        (cutoff, exclude_session_id),
+    ).fetchall()
+    latest = {}
+    for session_id, ts, content in rows:
+        latest[session_id] = (ts, content)  # ascending order -> last write wins per session
+    out = []
+    for session_id, (ts, content) in latest.items():
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            parsed = {"summary": content, "next": "", "questions": ""}
+        out.append((session_id, ts, parsed))
+    out.sort(key=lambda row: row[1], reverse=True)
+    return out
+
+
+def format_handovers(handovers):
+    if not handovers:
+        return "No prior handover found (first session on this repo, or none in the last "\
+            f"{HANDOVER_WINDOW_HOURS}h)."
+    blocks = []
+    for session_id, ts, parsed in handovers:
+        blocks.append(
+            f"# Handover from session {session_id} (saved {ts})\n"
+            f"Summary: {parsed.get('summary', '')}\n"
+            f"Next steps: {parsed.get('next', '')}\n"
+            f"Open questions: {parsed.get('questions', '')}"
+        )
+    return "\n\n".join(blocks)
+
+
 def cmd_session_start(_args):
     data = read_stdin_json()
     session_id = data.get("session_id", "")
@@ -357,43 +409,22 @@ def cmd_session_start(_args):
     activity_note = session_activity_note(conn, session_id)
     todos_line = todos_note(conn)
     touch_session(conn, session_id)
-    row = conn.execute(
-        "SELECT ts, content FROM log WHERE type = 'handover' ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    handovers = recent_handovers(conn, session_id)
     conn.close()
 
     git_line = git_worktree_summary()
+    handover_block = format_handovers(handovers)
 
-    if row:
-        ts, content = row
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            parsed = {"summary": content, "next": "", "questions": ""}
-        context = (
-            f"# Handover (last saved {ts})\n"
-            f"Summary: {parsed.get('summary', '')}\n"
-            f"Next steps: {parsed.get('next', '')}\n"
-            f"Open questions: {parsed.get('questions', '')}\n\n"
-            f"{git_line}\n"
-            f"{activity_note}\n\n"
-            f"{todos_line}\n\n"
-            f"This session id: {session_id}\n"
-            f"Before finishing this session, log a handover:\n"
-            f'python .claude/scripts/db.py log --session {session_id} '
-            f'--summary "..." --next "..." [--questions "..."]'
-        )
-    else:
-        context = (
-            "No prior handover found (first session on this repo).\n"
-            f"{git_line}\n"
-            f"{activity_note}\n\n"
-            f"{todos_line}\n\n"
-            f"This session id: {session_id}\n"
-            f"Before finishing this session, log a handover:\n"
-            f'python .claude/scripts/db.py log --session {session_id} '
-            f'--summary "..." --next "..." [--questions "..."]'
-        )
+    context = (
+        f"{handover_block}\n\n"
+        f"{git_line}\n"
+        f"{activity_note}\n\n"
+        f"{todos_line}\n\n"
+        f"This session id: {session_id}\n"
+        f"Before finishing this session, log a handover:\n"
+        f'python .claude/scripts/db.py log --session {session_id} '
+        f'--summary "..." --next "..." [--questions "..."]'
+    )
 
     print(json.dumps({
         "hookSpecificOutput": {
