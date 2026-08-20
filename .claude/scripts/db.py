@@ -89,6 +89,24 @@ Subcommands:
                                                 then a hard (145k) handover-now
                                                 nudge. Never blocks; silent on
                                                 any error.
+  todo-remind                                  PostToolUse hook, matcher
+                                                "TodoWrite" (see settings.json).
+                                                Fires every time the built-in
+                                                TodoWrite tool is used and
+                                                injects a static reminder to
+                                                mirror any durable, cross-
+                                                session items into this table
+                                                via todo-add - TodoWrite itself
+                                                is per-session/ephemeral and
+                                                cannot supply the required
+                                                priority/category, so this
+                                                cannot be fully automatic; it's
+                                                a nudge, not a sync. Always
+                                                fires, never dedups - cheap and
+                                                the repetition on multi-call
+                                                turns is an accepted tradeoff
+                                                over building dedup logic for
+                                                it.
   session-end [--session ID]                   No --session: stdin hook JSON
                                                 (session_id) - SessionEnd
                                                 hook, marks that session's row
@@ -605,6 +623,21 @@ def cmd_log(args):
     print(json.dumps({"systemMessage": "Handover logged."}))
 
 
+def cmd_todo_remind(_args):
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": (
+                "[TODO SYNC] If any item just written to the TodoWrite list is a "
+                "durable, cross-session work item (not just a step for the task "
+                "in front of you), mirror it into the persistent backlog now: "
+                "python .claude/scripts/db.py todo-add --title T --category "
+                "infra|app --priority 1-4 [--details D]"
+            ),
+        }
+    }))
+
+
 def cmd_session_end(args):
     try:
         session_id = args.session
@@ -739,6 +772,8 @@ def main():
     sub.add_parser("session-start").set_defaults(func=cmd_session_start)
     sub.add_parser("stop-check").set_defaults(func=cmd_stop_check)
     sub.add_parser("context-check").set_defaults(func=cmd_context_check)
+
+    sub.add_parser("todo-remind").set_defaults(func=cmd_todo_remind)
 
     session_end_p = sub.add_parser("session-end")
     session_end_p.add_argument(
