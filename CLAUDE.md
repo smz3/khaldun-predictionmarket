@@ -1,92 +1,32 @@
 # khaldun-predictionmarket
 
-Prediction market app. This repo also carries the standard Claude-collaboration
-infra (DB, handover, hooks) meant to be copied into other projects.
+Prediction market app. Also carries the standard Claude-collaboration infra
+(DB, handover, hooks) meant to be copied into other projects.
 
 ## Session continuity
 
-- `.claude/state.db` (SQLite, gitignored, local-only) holds `handovers`,
-  `context_watch`, `sessions`, `todos` — real named columns, no JSON-blob
-  columns anywhere, so it's readable directly in the VS Code SQLite Viewer
-  extension without decoding anything.
-- SessionStart hook auto-injects the latest handover from *each* session that
-  logged one in the last 24h (`HANDOVER_WINDOW_HOURS` in db.py), not just the
-  single most recent row repo-wide — deliberate, since multiple parallel
-  agent sessions can each finish and log around the same time, and an
-  overall-latest query would silently hide every session but the last writer.
-- Handover logging is purely on-command — there is deliberately NO automatic
-  safety net. The Stop hook only bumps this session's heartbeat now; it does
-  not log anything or block. If a session gets abandoned without `/handover`
-  ever running, the next session sees nothing from it — accepted tradeoff for
-  keeping logging fully manual and not logging "every smallest thing."
-- **`/handover`** — say this (or just ask to "wrap up") to end a session
-  cleanly: it saves uncommitted work via `git_safe.py`, writes a summary/
-  next-steps/open-questions handover to state.db, and confirms it's safe to
-  close. "Handover logged" only means the note was saved — it does not close
-  the session by itself; closing the tab/window is still on you.
-- `sessions` table has a random `name` (adjective-noun, e.g. `brave-orca`) per
-  session purely so it's easy to tell rows apart at a glance, and a `status`
-  (`live`/`dead`). SessionEnd hook marks a session `dead` on explicit
-  exit/`/clear`/logout. For the case SessionEnd doesn't reliably catch —
-  abandoned by jumping straight to a new session without closing the old one
-  — `reap_stale_sessions()` (in `db.py`, called on every heartbeat) writes
-  `status='dead'` back to the row itself once it's been stale for
-  `STALE_MINUTES`, or stuck on a single heartbeat for more than
-  `LIKELY_DEAD_GRACE_MINUTES`. So `status` in the table is always trustworthy
-  on its own, not just a display-time filter.
-- **`todos` table** — the source of truth for cross-session work items
-  (columns in order: id, status, priority, category, task_title,
-  task_details, created_ts, updated_ts). Unlike handover's free-text "next
-  steps", a todo keeps showing up at every SessionStart until it's
-  explicitly closed/rejected — nothing gets silently dropped just because a
-  later handover's prose didn't repeat it.
-  - `status`: open / discussing / rejected / closed.
-  - `priority`: 1 (blocking, do next) / 2 (important, soon) / 3 (worth
-    doing) / 4 (someday) — required (NOT NULL, DB-constrained), no
-    untriaged state; our own plain-language levels, deliberately not
-    Eisenhower's quadrants (its "delegate" category doesn't apply to a
-    two-party repo).
-  - `category`: `infra` (the Claude-collaboration tooling) or `app` (the
-    prediction-market product) — required, same as priority.
-  - Sort order everywhere is priority-first, then id.
-  - Soft cap: once open+discussing hits 6, `todo-add`/`todo-status`/
-    SessionStart print a reminder to triage — not a hard block.
-  - Manage via `db.py todo-add`, `todo-status` (note gets appended, not
-    overwritten — use it to record why something was rejected/closed),
-    `todo-list`. `/handover` syncs this every time it runs.
-- DB helper: `.claude/scripts/db.py` (stdlib-only, run with `python`). Has a
-  `prune` subcommand (manual only) to delete old context_watch/dead-session
-  rows once state.db grows large — handovers and todos rows are never
-  pruned.
-- Context tripwire warns once at 100k tokens (soft) and once at 145k (hard)
-  — a real reading of the transcript's own usage numbers, not a guess. Wired
-  to both UserPromptSubmit and PostToolUse, not just UserPromptSubmit alone
-  — a single long turn can run many tool calls with no new user prompt in
-  between, and checking only at prompt boundaries let usage blow straight
-  past 145k unnoticed in practice (once observed not caught until 195k).
-  PostToolUse re-checks after every tool call so mid-turn growth gets caught
-  too. On the hard warning: finish only what's in flight, log a handover,
-  start a fresh session.
+- `.claude/state.db` (SQLite, gitignored) holds `handovers`, `context_watch`,
+  `sessions`, `todos`. Full schema + rationale: docstring in
+  `.claude/scripts/db.py`.
+- SessionStart shows the latest handover per session (last 24h).
+- `/handover` — wrap up a session: saves work, syncs todos, logs a handover.
+- `todos` table is the source of truth for cross-session work items. Manage
+  via `db.py todo-add` / `todo-status` / `todo-list`.
+- Context tripwire: warns at 100k tokens (soft), 145k (hard). Checked on
+  both UserPromptSubmit and PostToolUse.
+- `sessions.status` self-heals on your next heartbeat — safe to resume a
+  session after being idle past 30min.
 
 ## Git workflow
 
-- Rule: never two sessions writing the same folder at once. If another
-  session might be active here, work in a worktree instead of `main`.
-- SessionStart already tells you the answer — it reports the current branch,
-  any other worktrees, and any other session with a heartbeat in the last
-  30 minutes. If it flags another session, run `EnterWorktree` before
-  touching files.
-- Nothing flagged and working solo -> just use `main` directly.
-- Worktree task done -> merge into `main`, then remove the worktree.
-- Commit/push through `.claude/scripts/git_safe.py`, not raw `git commit`/
-  `git push` — it refuses to stage secret-looking files (`.env`, `*.pem`,
-  `*.key`, `*credentials*.json`, ...), never force-pushes, and checks the
-  branch isn't behind its upstream. Policy: auto-push after every commit, any
-  branch, no per-push confirmation needed (solo repo, no collaborators/CI
-  yet — revisit if that changes). Push takes `--session <id>` so it can warn/
-  block on `main` if another session looks active; `--override-session-guard`
-  is for a human-confirmed manual override when that session is actually
-  dead.
+- SessionStart flags another active session on `main`? Use a worktree
+  (`EnterWorktree`), don't edit directly.
+- Nothing flagged, working solo -> use `main` directly.
+- Worktree done -> merge into `main`, remove the worktree.
+- Commit/push via `.claude/scripts/git_safe.py`, not raw `git commit`/
+  `git push`. Auto-push after every commit, no confirmation needed.
+- Push takes `--session <id>`. Use `--override-session-guard` only once
+  you've confirmed the flagged session is actually dead.
 
 ## Stack
 
