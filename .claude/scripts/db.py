@@ -16,9 +16,10 @@ Table: sessions(name, started_ts, last_seen_ts, status, session_id)
   One row per session, updated in place. name is a random adjective-noun
   label assigned once on first touch, purely so a human can tell sessions
   apart at a glance - not an identifier, session_id still is. started_ts set
-  once; last_seen_ts bumped on every session-start and stop-check call (a
-  heartbeat, since stop-check fires every turn - this is the ONLY thing
-  stop-check still does). status = 'live' | 'dead': set to 'live' on every
+  once; last_seen_ts bumped on every session-start, stop-check, and
+  context-check call (a heartbeat - context-check is wired to both
+  UserPromptSubmit and PostToolUse, so it also gives tool-call granularity,
+  not just once per turn). status = 'live' | 'dead': set to 'live' on every
   heartbeat, set to 'dead' by session-end (which used to delete the row
   outright - now it marks it dead instead, so closed sessions stay visible).
   A session abandoned without SessionEnd firing is caught by
@@ -30,25 +31,28 @@ Table: context_watch(id, ts, session_id, level)
   level = 'soft' | 'hard'. One row per threshold crossed per session -
   written once each by context-check so the same token-usage nudge doesn't
   repeat every turn. Low volume by construction (at most 2 rows/session).
-Table: todos(id, status, priority, category, task_title, task_details,
+Table: tasks(id, status, priority, category, task_title, task_details,
              created_ts, updated_ts)
+  Named `todos` before 2026-08-20 - renamed for how much easier "task" is to
+  type/say than "todo"; get_conn() migrates any pre-existing `todos` table's
+  rows across once, then drops it.
   status = 'open' | 'discussing' | 'rejected' | 'closed' (CHECK-constrained).
   priority = 1 (blocking/do next) | 2 (important, soon) | 3 (worth doing, no
   rush) | 4 (someday). Required (NOT NULL, CHECK-constrained) - no untriaged
-  state, every todo gets a real priority at creation. Not Eisenhower's
+  state, every task gets a real priority at creation. Not Eisenhower's
   quadrants on purpose — "delegate" doesn't mean anything in a two-party
   repo, so these are our own plain-language levels instead.
   category = 'infra' (the Claude-collaboration tooling, meant to be portable
   to other projects) | 'app' (the prediction-market product itself). Required,
   same as priority.
   The source of truth for cross-session work items — unlike handover's free-
-  text "next steps", a todo persists and keeps showing up at every
+  text "next steps", a task persists and keeps showing up at every
   SessionStart until it's explicitly moved to rejected/closed, so nothing
   gets silently dropped just because a later handover's prose didn't repeat
   it. task_details doubles as the running note: status changes append a
   timestamped note there (e.g. why something was rejected) rather than
   overwriting the original description. Sort order everywhere is priority,
-  then id. See TODO_BLOAT_THRESHOLD for the soft-cap reminder on
+  then id. See TASK_BLOAT_THRESHOLD for the soft-cap reminder on
   open+discussing count.
 
 Subcommands:
@@ -82,31 +86,39 @@ Subcommands:
                                                 until 195k). PostToolUse re-runs
                                                 the same check after every tool
                                                 call so growth mid-turn gets
-                                                seen too. Reads the real token
-                                                usage of the last assistant turn
-                                                from the transcript; once per
-                                                session, prints a soft (100k)
-                                                then a hard (145k) handover-now
-                                                nudge. Never blocks; silent on
-                                                any error.
-  todo-remind                                  PostToolUse hook, matcher
-                                                "TodoWrite" (see settings.json).
-                                                Fires every time the built-in
-                                                TodoWrite tool is used and
-                                                injects a static reminder to
-                                                mirror any durable, cross-
-                                                session items into this table
-                                                via todo-add - TodoWrite itself
-                                                is per-session/ephemeral and
-                                                cannot supply the required
-                                                priority/category, so this
-                                                cannot be fully automatic; it's
-                                                a nudge, not a sync. Always
-                                                fires, never dedups - cheap and
-                                                the repetition on multi-call
-                                                turns is an accepted tradeoff
-                                                over building dedup logic for
-                                                it.
+                                                seen too. Also bumps the session
+                                                heartbeat on every call (see
+                                                STALE_MINUTES) before the token
+                                                check, so that side effect still
+                                                happens even when token usage
+                                                can't be read. Reads the real
+                                                token usage of the last
+                                                assistant turn from the
+                                                transcript; once per session,
+                                                prints a soft (100k) then a
+                                                hard (145k) handover-now nudge.
+                                                Never blocks; silent on any
+                                                error.
+  task-remind                                  PostToolUse hook, matcher
+                                                "TodoWrite" (see settings.json,
+                                                "TodoWrite" is Claude Code's
+                                                own built-in tool name, not
+                                                ours to rename). Fires every
+                                                time the built-in TodoWrite
+                                                tool is used and injects a
+                                                static reminder to mirror any
+                                                durable, cross-session items
+                                                into this table via task-add -
+                                                TodoWrite itself is per-
+                                                session/ephemeral and cannot
+                                                supply the required priority/
+                                                category, so this cannot be
+                                                fully automatic; it's a nudge,
+                                                not a sync. Always fires,
+                                                never dedups - cheap and the
+                                                repetition on multi-call turns
+                                                is an accepted tradeoff over
+                                                building dedup logic for it.
   session-end [--session ID]                   No --session: stdin hook JSON
                                                 (session_id) - SessionEnd
                                                 hook, marks that session's row
@@ -138,20 +150,20 @@ Subcommands:
                                                 handovers are never deleted.
                                                 Manual only - not wired to a
                                                 hook.
-  todo-add --title T --category infra|app       Insert a todo, status='open'.
+  task-add --title T --category infra|app       Insert a task, status='open'.
     --priority 1-4 [--details D]                Priority is required, same
                                                  as category. Prints its id
                                                  (+ a bloat reminder once
                                                  open+discussing reaches
-                                                 TODO_BLOAT_THRESHOLD).
-  todo-status --id N --status S [--note N]      Update a todo's status
+                                                 TASK_BLOAT_THRESHOLD).
+  task-status --id N --status S [--note N]      Update a task's status
     [--priority 1-4] [--category infra|app]     ('open'|'discussing'|
                                                  'rejected'|'closed'). --note
                                                  is appended (timestamped) to
                                                  task_details, not a
                                                  replacement. Omit --priority/
                                                  --category to leave unchanged.
-  todo-list [--status S1,S2,...]               Print todos as JSON, sorted
+  task-list [--status S1,S2,...]               Print tasks as JSON, sorted
     [--category infra|app]                     priority-first. Default
                                                 status filter: open,discussing.
 """
@@ -184,11 +196,11 @@ STALE_MINUTES = 5
 # session (e.g. closed by jumping straight to a new session) than of a
 # session still working its first turn.
 LIKELY_DEAD_GRACE_MINUTES = 3
-# Soft cap, not a hard block: once open+discussing todos reach this count,
-# todo-add/todo-status/SessionStart surface a reminder to close/reject/
+# Soft cap, not a hard block: once open+discussing tasks reach this count,
+# task-add/task-status/SessionStart surface a reminder to close/reject/
 # deprioritize before piling on more, instead of letting the list bloat
 # silently.
-TODO_BLOAT_THRESHOLD = 6
+TASK_BLOAT_THRESHOLD = 6
 # SessionStart shows at most this many distinct sessions' latest undelivered
 # handover (current + 1 previous) - not a time window. Combined with the
 # delivered flag, a handover is shown once (to whichever session starts
@@ -247,7 +259,7 @@ def get_conn():
         )"""
     )
     conn.execute(
-        """CREATE TABLE IF NOT EXISTS todos (
+        """CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             status TEXT NOT NULL CHECK(status IN ('open', 'discussing', 'rejected', 'closed')),
             priority INTEGER NOT NULL CHECK(priority IN (1, 2, 3, 4)),
@@ -258,6 +270,21 @@ def get_conn():
             updated_ts TEXT NOT NULL
         )"""
     )
+    # One-time migration from the old `todos` table name (renamed 2026-08-20).
+    # Idempotent: once the rows are copied and `todos` dropped, this is a
+    # no-op on every later call since the SELECT finds no such table.
+    had_todos = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='todos'"
+    ).fetchone()
+    if had_todos:
+        conn.execute(
+            "INSERT INTO tasks (id, status, priority, category, task_title, "
+            "task_details, created_ts, updated_ts) "
+            "SELECT id, status, priority, category, task_title, task_details, "
+            "created_ts, updated_ts FROM todos"
+        )
+        conn.execute("DROP TABLE todos")
+        conn.commit()
     return conn
 
 
@@ -373,10 +400,10 @@ def session_activity_note(conn, session_id):
     A session that never ticked past its first heartbeat (last_seen_ts ==
     started_ts) is downgraded to "likely dead" - and excluded from the
     blocking count - once it's older than LIKELY_DEAD_GRACE_MINUTES. Real
-    sessions accumulate a Stop-hook tick roughly once per turn; a session
-    stuck on exactly one heartbeat for several minutes was almost always
-    abandoned (e.g. closed by jumping straight to a new session), not left
-    mid-turn.
+    sessions accumulate a heartbeat tick roughly once per turn or tool call; a
+    session stuck on exactly one heartbeat for several minutes was almost
+    always abandoned (e.g. closed by jumping straight to a new session), not
+    left mid-turn.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)
     dead_grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=LIKELY_DEAD_GRACE_MINUTES)
@@ -428,39 +455,39 @@ def session_activity_note(conn, session_id):
     return note
 
 
-def check_todo_bloat(conn):
-    """Soft-cap reminder, not a block: nudge once open+discussing todos reach
-    TODO_BLOAT_THRESHOLD, so the list gets triaged before it grows unreadable.
+def check_task_bloat(conn):
+    """Soft-cap reminder, not a block: nudge once open+discussing tasks reach
+    TASK_BLOAT_THRESHOLD, so the list gets triaged before it grows unreadable.
     """
     count = conn.execute(
-        "SELECT COUNT(*) FROM todos WHERE status IN ('open', 'discussing')"
+        "SELECT COUNT(*) FROM tasks WHERE status IN ('open', 'discussing')"
     ).fetchone()[0]
-    if count < TODO_BLOAT_THRESHOLD:
+    if count < TASK_BLOAT_THRESHOLD:
         return None
     return (
-        f"{count} open/discussing todos - at or above the soft limit of "
-        f"{TODO_BLOAT_THRESHOLD}. Not a hard block, but close, reject, or "
+        f"{count} open/discussing tasks - at or above the soft limit of "
+        f"{TASK_BLOAT_THRESHOLD}. Not a hard block, but close, reject, or "
         f"deprioritize some before adding more."
     )
 
 
-def todos_note(conn):
-    """Every todo still open or discussing, for SessionStart - so an item can't
+def tasks_note(conn):
+    """Every task still open or discussing, for SessionStart - so an item can't
     silently drop off just because a later handover's prose didn't repeat it.
     Sorted priority-first, then by id.
     """
     rows = conn.execute(
-        "SELECT id, status, priority, category, task_title FROM todos "
+        "SELECT id, status, priority, category, task_title FROM tasks "
         "WHERE status IN ('open', 'discussing') ORDER BY priority, id"
     ).fetchall()
     if not rows:
-        return "No open or discussing todos."
+        return "No open or discussing tasks."
     lines = "\n".join(
         f"  #{tid} [{status}] P{priority} [{category}] {title}"
         for tid, status, priority, category, title in rows
     )
-    note = f"{len(rows)} open/discussing todo(s):\n{lines}"
-    bloat = check_todo_bloat(conn)
+    note = f"{len(rows)} open/discussing task(s):\n{lines}"
+    bloat = check_task_bloat(conn)
     if bloat:
         note = f"[REMINDER] {bloat}\n{note}"
     return note
@@ -515,7 +542,7 @@ def cmd_session_start(_args):
     session_id = data.get("session_id", "")
     conn = get_conn()
     activity_note = session_activity_note(conn, session_id)
-    todos_line = todos_note(conn)
+    tasks_line = tasks_note(conn)
     touch_session(conn, session_id)
     handovers = recent_handovers(conn, session_id)
     conn.close()
@@ -527,7 +554,7 @@ def cmd_session_start(_args):
         f"{handover_block}\n\n"
         f"{git_line}\n"
         f"{activity_note}\n\n"
-        f"{todos_line}\n\n"
+        f"{tasks_line}\n\n"
         f"This session id: {session_id}\n"
         f"Before finishing this session, log a handover:\n"
         f'python .claude/scripts/db.py log --session {session_id} '
@@ -640,15 +667,15 @@ def cmd_log(args):
     print(json.dumps({"systemMessage": "Handover logged."}))
 
 
-def cmd_todo_remind(_args):
+def cmd_task_remind(_args):
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
             "additionalContext": (
-                "[TODO SYNC] If any item just written to the TodoWrite list is a "
+                "[TASK SYNC] If any item just written to the TodoWrite list is a "
                 "durable, cross-session work item (not just a step for the task "
                 "in front of you), mirror it into the persistent backlog now: "
-                "python .claude/scripts/db.py todo-add --title T --category "
+                "python .claude/scripts/db.py task-add --title T --category "
                 "infra|app --priority 1-4 [--details D]"
             ),
         }
@@ -673,20 +700,20 @@ def cmd_session_end(args):
         return
 
 
-def cmd_todo_add(args):
+def cmd_task_add(args):
     conn = get_conn()
     ts = now()
     cur = conn.execute(
-        "INSERT INTO todos (status, priority, category, task_title, task_details, created_ts, updated_ts) "
+        "INSERT INTO tasks (status, priority, category, task_title, task_details, created_ts, updated_ts) "
         "VALUES ('open', ?, ?, ?, ?, ?, ?)",
         (args.priority, args.category, args.title, args.details or "", ts, ts),
     )
     conn.commit()
-    todo_id = cur.lastrowid
-    bloat = check_todo_bloat(conn)
+    task_id = cur.lastrowid
+    bloat = check_task_bloat(conn)
     conn.close()
     result = {
-        "id": todo_id,
+        "id": task_id,
         "status": "open",
         "priority": args.priority,
         "category": args.category,
@@ -697,13 +724,13 @@ def cmd_todo_add(args):
     print(json.dumps(result))
 
 
-def cmd_todo_status(args):
+def cmd_task_status(args):
     conn = get_conn()
     row = conn.execute(
-        "SELECT task_details, priority, category FROM todos WHERE id = ?", (args.id,)
+        "SELECT task_details, priority, category FROM tasks WHERE id = ?", (args.id,)
     ).fetchone()
     if row is None:
-        print(json.dumps({"error": f"no todo with id {args.id}"}))
+        print(json.dumps({"error": f"no task with id {args.id}"}))
         conn.close()
         sys.exit(1)
 
@@ -719,11 +746,11 @@ def cmd_todo_status(args):
         category = args.category
 
     conn.execute(
-        "UPDATE todos SET status = ?, priority = ?, category = ?, task_details = ?, updated_ts = ? WHERE id = ?",
+        "UPDATE tasks SET status = ?, priority = ?, category = ?, task_details = ?, updated_ts = ? WHERE id = ?",
         (args.status, priority, category, details, now(), args.id),
     )
     conn.commit()
-    bloat = check_todo_bloat(conn)
+    bloat = check_task_bloat(conn)
     conn.close()
     result = {"id": args.id, "status": args.status, "priority": priority, "category": category}
     if bloat:
@@ -731,7 +758,7 @@ def cmd_todo_status(args):
     print(json.dumps(result))
 
 
-def cmd_todo_list(args):
+def cmd_task_list(args):
     statuses = [s.strip() for s in (args.status or "open,discussing").split(",") if s.strip()]
     placeholders = ",".join("?" for _ in statuses)
     params = list(statuses)
@@ -742,7 +769,7 @@ def cmd_todo_list(args):
     conn = get_conn()
     rows = conn.execute(
         f"SELECT id, status, priority, category, task_title, task_details, created_ts, updated_ts "
-        f"FROM todos WHERE status IN ({placeholders}){category_clause} "
+        f"FROM tasks WHERE status IN ({placeholders}){category_clause} "
         f"ORDER BY priority, id",
         params,
     ).fetchall()
@@ -790,7 +817,7 @@ def main():
     sub.add_parser("stop-check").set_defaults(func=cmd_stop_check)
     sub.add_parser("context-check").set_defaults(func=cmd_context_check)
 
-    sub.add_parser("todo-remind").set_defaults(func=cmd_todo_remind)
+    sub.add_parser("task-remind").set_defaults(func=cmd_task_remind)
 
     session_end_p = sub.add_parser("session-end")
     session_end_p.add_argument(
@@ -813,32 +840,32 @@ def main():
     prune_p.add_argument("--vacuum", action="store_true")
     prune_p.set_defaults(func=cmd_prune)
 
-    todo_add_p = sub.add_parser("todo-add")
-    todo_add_p.add_argument("--title", required=True)
-    todo_add_p.add_argument("--details", default="")
-    todo_add_p.add_argument("--category", required=True, choices=["infra", "app"])
-    todo_add_p.add_argument("--priority", type=int, required=True, choices=[1, 2, 3, 4])
-    todo_add_p.set_defaults(func=cmd_todo_add)
+    task_add_p = sub.add_parser("task-add")
+    task_add_p.add_argument("--title", required=True)
+    task_add_p.add_argument("--details", default="")
+    task_add_p.add_argument("--category", required=True, choices=["infra", "app"])
+    task_add_p.add_argument("--priority", type=int, required=True, choices=[1, 2, 3, 4])
+    task_add_p.set_defaults(func=cmd_task_add)
 
-    todo_status_p = sub.add_parser("todo-status")
-    todo_status_p.add_argument("--id", type=int, required=True)
-    todo_status_p.add_argument(
+    task_status_p = sub.add_parser("task-status")
+    task_status_p.add_argument("--id", type=int, required=True)
+    task_status_p.add_argument(
         "--status", required=True, choices=["open", "discussing", "rejected", "closed"]
     )
-    todo_status_p.add_argument("--note", default="")
-    todo_status_p.add_argument(
+    task_status_p.add_argument("--note", default="")
+    task_status_p.add_argument(
         "--priority", type=int, choices=[1, 2, 3, 4], default=None,
         help="omit to leave unchanged",
     )
-    todo_status_p.add_argument(
+    task_status_p.add_argument(
         "--category", choices=["infra", "app"], default=None, help="omit to leave unchanged"
     )
-    todo_status_p.set_defaults(func=cmd_todo_status)
+    task_status_p.set_defaults(func=cmd_task_status)
 
-    todo_list_p = sub.add_parser("todo-list")
-    todo_list_p.add_argument("--status", default="")
-    todo_list_p.add_argument("--category", choices=["infra", "app"], default=None)
-    todo_list_p.set_defaults(func=cmd_todo_list)
+    task_list_p = sub.add_parser("task-list")
+    task_list_p.add_argument("--status", default="")
+    task_list_p.add_argument("--category", choices=["infra", "app"], default=None)
+    task_list_p.set_defaults(func=cmd_task_list)
 
     args = parser.parse_args()
     args.func(args)

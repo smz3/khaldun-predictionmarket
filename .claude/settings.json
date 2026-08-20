@@ -34,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python .claude/scripts/db.py todo-remind",
+            "command": "python .claude/scripts/db.py task-remind",
             "shell": "bash",
             "timeout": 10
           }

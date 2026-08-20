@@ -6,17 +6,19 @@ Prediction market app. Also carries the standard Claude-collaboration infra
 ## Session continuity
 
 - `.claude/state.db` (SQLite, gitignored) holds `handovers`, `context_watch`,
-  `sessions`, `todos`. Full schema + rationale: docstring in
+  `sessions`, `tasks`. Full schema + rationale: docstring in
   `.claude/scripts/db.py`.
 - SessionStart shows the current + 1 previous undelivered handover, then
   marks them delivered so they don't repeat.
-- `/handover` — wrap up a session: saves work, syncs todos, logs a handover.
-- `todos` table is the source of truth for cross-session work items. Manage
-  via `db.py todo-add` / `todo-status` / `todo-list`.
+- `/handover` — wrap up a session: saves work, syncs tasks, logs a handover.
+- `tasks` table is the source of truth for cross-session work items. Manage
+  via `db.py task-add` / `task-status` / `task-list`. When the user hands you
+  a new work item in conversation, log it immediately in the same turn -
+  don't wait to be asked.
 - Context tripwire: warns at 100k tokens (soft), 145k (hard). Checked on
   both UserPromptSubmit and PostToolUse.
 - `sessions.status` self-heals on your next heartbeat — safe to resume a
-  session after being idle past 30min.
+  session after being idle past 5min.
 
 ## Git workflow
 
