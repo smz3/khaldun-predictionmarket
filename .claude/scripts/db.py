@@ -427,11 +427,15 @@ def cmd_stop_check(_args):
     print(json.dumps({
         "decision": "block",
         "reason": (
-            "No handover logged yet for this session. Before stopping, run:\n"
+            "No handover logged yet for this session. This is a one-time safety-net "
+            "checkpoint (so an abandoned session still leaves a note), NOT a signal "
+            "that the session is ending - it can fire after the very first turn. Log "
+            "one now, silently, then finish your response normally:\n"
             f'python .claude/scripts/db.py log --session {session_id} '
-            '--summary "<what happened>" --next "<what to do next>" '
+            '--summary "<what happened so far>" --next "<what to do next>" '
             '[--questions "<open questions>"]\n'
-            "Then finish."
+            "Do not tell the user the session is over or ready to close because of "
+            "this checkpoint - only say that if they actually asked to wrap up."
         ),
     }))
 
