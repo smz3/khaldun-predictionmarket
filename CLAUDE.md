@@ -10,7 +10,20 @@ infra (DB, handover, hooks) meant to be copied into other projects.
 - SessionStart hook auto-injects the last handover into context.
 - Stop hook blocks once if no handover was logged this session — follow the
   command it prints (`.claude/scripts/db.py log --session ...`).
-- DB helper: `.claude/scripts/db.py` (stdlib-only, run with `python`).
+- **`/handover`** — say this (or just ask to "wrap up") to end a session
+  cleanly: it saves uncommitted work via `git_safe.py`, writes a summary/
+  next-steps/open-questions handover to state.db, and confirms it's safe to
+  close. "Handover logged" only means the note was saved — it does not close
+  the session by itself; closing the tab/window is still on you.
+- SessionEnd hook clears a session's row on explicit exit/`/clear`/logout.
+  It's not confirmed to fire when a session is abandoned by jumping straight
+  to a new one without closing the old one — that case is instead covered by
+  a grace period (a session stuck on a single heartbeat for more than 3min
+  stops counting as "active").
+- DB helper: `.claude/scripts/db.py` (stdlib-only, run with `python`). Has a
+  `prune` subcommand (manual only) to delete old session_start/facts/
+  context_watch/dead-session rows once state.db grows large — handover rows
+  are never pruned.
 - UserPromptSubmit hook warns once at 100k tokens (soft) and once at 145k
   (hard) — a real reading of the transcript's own usage numbers, not a guess.
   On the hard warning: finish only what's in flight, log a handover, start a
@@ -26,6 +39,15 @@ infra (DB, handover, hooks) meant to be copied into other projects.
   touching files.
 - Nothing flagged and working solo -> just use `main` directly.
 - Worktree task done -> merge into `main`, then remove the worktree.
+- Commit/push through `.claude/scripts/git_safe.py`, not raw `git commit`/
+  `git push` — it refuses to stage secret-looking files (`.env`, `*.pem`,
+  `*.key`, `*credentials*.json`, ...), never force-pushes, and checks the
+  branch isn't behind its upstream. Policy: auto-push after every commit, any
+  branch, no per-push confirmation needed (solo repo, no collaborators/CI
+  yet — revisit if that changes). Push takes `--session <id>` so it can warn/
+  block on `main` if another session looks active; `--override-session-guard`
+  is for a human-confirmed manual override when that session is actually
+  dead.
 
 ## Stack
 
