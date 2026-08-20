@@ -24,11 +24,14 @@ infra (DB, handover, hooks) meant to be copied into other projects.
   next-steps/open-questions handover to state.db, and confirms it's safe to
   close. "Handover logged" only means the note was saved — it does not close
   the session by itself; closing the tab/window is still on you.
-- SessionEnd hook clears a session's row on explicit exit/`/clear`/logout.
-  It's not confirmed to fire when a session is abandoned by jumping straight
-  to a new one without closing the old one — that case is instead covered by
-  a grace period (a session stuck on a single heartbeat for more than 3min
-  stops counting as "active").
+- `sessions` table has a random `name` (adjective-noun, e.g. `brave-orca`) per
+  session purely so it's easy to tell rows apart at a glance, and a `status`
+  (`live`/`dead`). SessionEnd hook marks a session `dead` on explicit
+  exit/`/clear`/logout (used to delete the row; now kept for visibility).
+  Not confirmed to fire when a session is abandoned by jumping straight to a
+  new one without closing the old one — that case is instead covered by a
+  grace period (a session stuck on a single heartbeat for more than 3min
+  stops counting as "active"), independent of the `status` column.
 - **`todos` table** — the source of truth for cross-session work items
   (columns in order: id, status, priority, category, task_title,
   task_details, created_ts, updated_ts). Unlike handover's free-text "next

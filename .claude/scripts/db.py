@@ -1,7 +1,7 @@
 """
 Local state DB for session continuity. Stdlib only (sqlite3), no deps.
 
-Table: handovers(id, ts, session_id, summary, next_steps, questions)
+Table: handovers(id, ts, summary, next_steps, questions, session_id)
   Plain columns, no JSON - written ONLY on-command (the `log` subcommand,
   normally via the /handover skill), never automatically. A session that
   ends without the user saying "handover" leaves no row here - that's
@@ -11,13 +11,19 @@ Table: handovers(id, ts, session_id, summary, next_steps, questions)
   (not just the single latest row overall), so parallel agent sessions
   finishing around the same time don't shadow each other's context. Never
   pruned.
-Table: sessions(session_id, started_ts, last_seen_ts)
-  One row per session, updated in place. started_ts set once; last_seen_ts
-  bumped on every session-start and stop-check call (a heartbeat, since
-  stop-check fires every turn - this is the ONLY thing stop-check still
-  does). Used to warn a new session if another session was seen recently in
-  this repo (see STALE_MINUTES) — crashed sessions age out instead of
-  leaving a permanent false "active" flag.
+Table: sessions(name, started_ts, last_seen_ts, status, session_id)
+  One row per session, updated in place. name is a random adjective-noun
+  label assigned once on first touch, purely so a human can tell sessions
+  apart at a glance - not an identifier, session_id still is. started_ts set
+  once; last_seen_ts bumped on every session-start and stop-check call (a
+  heartbeat, since stop-check fires every turn - this is the ONLY thing
+  stop-check still does). status = 'live' | 'dead': set to 'live' on every
+  heartbeat, set to 'dead' by session-end (which used to delete the row
+  outright - now it marks it dead instead, so closed sessions stay visible).
+  A session abandoned without SessionEnd firing stays 'live' forever by this
+  column alone - session_activity_note's timestamp-staleness check (see
+  STALE_MINUTES) is still what actually catches that case, status is a
+  separate, coarser signal ("was this ever cleanly closed").
 Table: context_watch(id, ts, session_id, level)
   level = 'soft' | 'hard'. One row per threshold crossed per session -
   written once each by context-check so the same token-usage nudge doesn't
@@ -115,6 +121,7 @@ Subcommands:
 import argparse
 import json
 import os
+import random
 import sqlite3
 import subprocess
 import sys
@@ -145,6 +152,16 @@ TODO_BLOAT_THRESHOLD = 6
 # writer. Bounded so old finished work doesn't pile up in every future
 # SessionStart forever.
 HANDOVER_WINDOW_HOURS = 24
+SESSION_NAME_ADJECTIVES = [
+    "brave", "calm", "eager", "fuzzy", "gentle", "happy", "jolly", "keen",
+    "lively", "mighty", "nimble", "proud", "quiet", "rapid", "sunny",
+    "witty", "zesty", "bold", "cozy", "daring",
+]
+SESSION_NAME_NOUNS = [
+    "falcon", "otter", "tiger", "panda", "eagle", "dolphin", "wolf", "fox",
+    "lynx", "hawk", "bear", "heron", "koala", "raven", "stag", "orca",
+    "puma", "crane", "gecko", "moth",
+]
 
 
 def get_conn():
@@ -153,10 +170,10 @@ def get_conn():
         """CREATE TABLE IF NOT EXISTS handovers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
-            session_id TEXT NOT NULL,
             summary TEXT NOT NULL,
             next_steps TEXT NOT NULL,
-            questions TEXT
+            questions TEXT,
+            session_id TEXT NOT NULL
         )"""
     )
     conn.execute(
@@ -169,9 +186,11 @@ def get_conn():
     )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
+            name TEXT,
             started_ts TEXT NOT NULL,
-            last_seen_ts TEXT NOT NULL
+            last_seen_ts TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'live' CHECK(status IN ('live', 'dead')),
+            session_id TEXT PRIMARY KEY
         )"""
     )
     conn.execute(
@@ -252,15 +271,23 @@ def git_worktree_summary():
     return f"Current branch: {branch}\n{note}"
 
 
+def random_session_name():
+    return f"{random.choice(SESSION_NAME_ADJECTIVES)}-{random.choice(SESSION_NAME_NOUNS)}"
+
+
 def touch_session(conn, session_id):
-    """Upsert this session's heartbeat. started_ts set once; last_seen_ts always bumped."""
+    """Upsert this session's heartbeat. name/started_ts set once (on insert);
+    last_seen_ts and status always bumped to 'live' - session-end is the only
+    thing that ever sets status back to 'dead'.
+    """
     if not session_id:
         return
     ts = now()
     conn.execute(
-        "INSERT INTO sessions (session_id, started_ts, last_seen_ts) VALUES (?, ?, ?) "
-        "ON CONFLICT(session_id) DO UPDATE SET last_seen_ts = excluded.last_seen_ts",
-        (session_id, ts, ts),
+        "INSERT INTO sessions (name, started_ts, last_seen_ts, status, session_id) "
+        "VALUES (?, ?, ?, 'live', ?) "
+        "ON CONFLICT(session_id) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, status = 'live'",
+        (random_session_name(), ts, ts, session_id),
     )
     conn.commit()
 
@@ -279,12 +306,16 @@ def session_activity_note(conn, session_id):
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)
     dead_grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=LIKELY_DEAD_GRACE_MINUTES)
     rows = conn.execute(
-        "SELECT session_id, started_ts, last_seen_ts FROM sessions WHERE session_id != ?",
+        "SELECT session_id, name, started_ts, last_seen_ts FROM sessions "
+        "WHERE session_id != ? AND status = 'live'",
         (session_id,),
     ).fetchall()
 
+    def label(sid, name):
+        return f"{name} ({sid})" if name else sid
+
     active, likely_dead = [], []
-    for sid, started, last_seen in rows:
+    for sid, name, started, last_seen in rows:
         try:
             last_ts = datetime.fromisoformat(last_seen)
             start_ts = datetime.fromisoformat(started)
@@ -294,27 +325,27 @@ def session_activity_note(conn, session_id):
             continue
         never_ticked = last_seen == started
         if never_ticked and start_ts < dead_grace_cutoff:
-            likely_dead.append((sid, last_seen))
+            likely_dead.append((sid, name, last_seen))
         else:
-            active.append((sid, last_seen))
+            active.append((sid, name, last_seen))
 
     if not active:
         base = f"No other sessions seen active in this repo in the last {STALE_MINUTES}min."
         if likely_dead:
-            lines = "\n".join(f"  {sid} (last seen {ts})" for sid, ts in likely_dead)
+            lines = "\n".join(f"  {label(sid, name)} (last seen {ts})" for sid, name, ts in likely_dead)
             base += (
                 f" ({len(likely_dead)} session(s) have a single stale heartbeat and "
                 f"are treated as likely-dead, not blocking:\n{lines})"
             )
         return base
 
-    lines = "\n".join(f"  {sid} (last seen {ts})" for sid, ts in active)
+    lines = "\n".join(f"  {label(sid, name)} (last seen {ts})" for sid, name, ts in active)
     note = (
         f"{len(active)} other session(s) possibly active in this repo (heartbeat "
         f"within {STALE_MINUTES}min) - check before editing outside a worktree:\n{lines}"
     )
     if likely_dead:
-        dead_lines = "\n".join(f"  {sid} (last seen {ts})" for sid, ts in likely_dead)
+        dead_lines = "\n".join(f"  {label(sid, name)} (last seen {ts})" for sid, name, ts in likely_dead)
         note += (
             f"\n{len(likely_dead)} other session(s) look likely-dead (single stale "
             f"heartbeat, not counted above):\n{dead_lines}"
@@ -513,7 +544,7 @@ def cmd_session_end(_args):
         if not session_id:
             return
         conn = get_conn()
-        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.execute("UPDATE sessions SET status = 'dead' WHERE session_id = ?", (session_id,))
         conn.commit()
         conn.close()
     except Exception:
