@@ -1,19 +1,27 @@
 """
 Local state DB for session continuity. Stdlib only (sqlite3), no deps.
 
-Table: log(id, ts, session_id, type, content)
-  type = 'session_start' | 'facts' | 'handover' | 'context_watch'
-  Handover rows are one-per-log-call, not one-per-session - a session can
-  log more than once. SessionStart surfaces the latest handover from EACH
-  session that logged one within HANDOVER_WINDOW_HOURS (not just the single
-  latest row repo-wide), so parallel agent sessions finishing around the
-  same time don't shadow each other's context.
+Table: handovers(id, ts, session_id, summary, next_steps, questions)
+  Plain columns, no JSON - written ONLY on-command (the `log` subcommand,
+  normally via the /handover skill), never automatically. A session that
+  ends without the user saying "handover" leaves no row here - that's
+  deliberate, not a bug (see cmd_stop_check). One row per log call, not one
+  per session - a session can log more than once. SessionStart surfaces the
+  latest row from EACH session that logged one within HANDOVER_WINDOW_HOURS
+  (not just the single latest row overall), so parallel agent sessions
+  finishing around the same time don't shadow each other's context. Never
+  pruned.
 Table: sessions(session_id, started_ts, last_seen_ts)
   One row per session, updated in place. started_ts set once; last_seen_ts
   bumped on every session-start and stop-check call (a heartbeat, since
-  stop-check fires every turn). Used to warn a new session if another
-  session was seen recently in this repo (see STALE_MINUTES) — crashed
-  sessions age out instead of leaving a permanent false "active" flag.
+  stop-check fires every turn - this is the ONLY thing stop-check still
+  does). Used to warn a new session if another session was seen recently in
+  this repo (see STALE_MINUTES) — crashed sessions age out instead of
+  leaving a permanent false "active" flag.
+Table: context_watch(id, ts, session_id, level)
+  level = 'soft' | 'hard'. One row per threshold crossed per session -
+  written once each by context-check so the same token-usage nudge doesn't
+  repeat every turn. Low volume by construction (at most 2 rows/session).
 Table: todos(id, status, priority, category, task_title, task_details,
              created_ts, updated_ts)
   status = 'open' | 'discussing' | 'rejected' | 'closed' (CHECK-constrained).
@@ -38,13 +46,20 @@ Table: todos(id, status, priority, category, task_title, task_details,
 Subcommands:
   init                                        create db/table if missing
   session-start                                stdin: hook JSON (session_id).
-                                                Records session start, prints
-                                                SessionStart hookSpecificOutput
-                                                JSON with the last handover.
+                                                Prints SessionStart
+                                                hookSpecificOutput JSON with
+                                                recent handovers (see
+                                                HANDOVER_WINDOW_HOURS).
   stop-check                                   stdin: hook JSON (session_id).
-                                                Records git facts. If no
-                                                handover logged this session,
-                                                prints a blocking decision.
+                                                Just bumps this session's
+                                                heartbeat in `sessions`.
+                                                Never blocks, never logs
+                                                anything else - handover
+                                                logging is purely on-command
+                                                (see `log` below), by design
+                                                there is no automatic
+                                                safety-net for an abandoned
+                                                session.
   context-check                                stdin: hook JSON (session_id,
                                                 transcript_path). UserPromptSubmit
                                                 hook. Reads the real token usage
@@ -70,13 +85,16 @@ Subcommands:
                                                 LIKELY_DEAD_GRACE_MINUTES).
                                                 Silent; never blocks.
   log --session ID --summary S --next N [--questions Q]
-                                                Insert a handover row.
-  prune [--days N] [--vacuum]                  Delete session_start/facts/
-                                                context_watch rows and dead
-                                                sessions rows older than N
-                                                days (default 30). handover
-                                                rows are never deleted. Manual
-                                                only - not wired to a hook.
+                                                Insert a handover row. The
+                                                only way a handover ever gets
+                                                written - normally invoked
+                                                via the /handover skill.
+  prune [--days N] [--vacuum]                  Delete context_watch rows and
+                                                dead sessions rows older than
+                                                N days (default 30).
+                                                handovers are never deleted.
+                                                Manual only - not wired to a
+                                                hook.
   todo-add --title T --category infra|app       Insert a todo, status='open'.
     --priority 1-4 [--details D]                Priority is required, same
                                                  as category. Prints its id
@@ -132,12 +150,21 @@ HANDOVER_WINDOW_HOURS = 24
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        """CREATE TABLE IF NOT EXISTS log (
+        """CREATE TABLE IF NOT EXISTS handovers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
-            session_id TEXT,
-            type TEXT NOT NULL,
-            content TEXT
+            session_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            next_steps TEXT NOT NULL,
+            questions TEXT
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS context_watch (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            level TEXT NOT NULL CHECK(level IN ('soft', 'hard'))
         )"""
     )
     conn.execute(
@@ -172,26 +199,6 @@ def read_stdin_json():
         return json.loads(raw) if raw.strip() else {}
     except (json.JSONDecodeError, ValueError):
         return {}
-
-
-def git_facts():
-    def run(args):
-        try:
-            out = subprocess.run(
-                ["git"] + args, capture_output=True, text=True, timeout=10
-            )
-            return out.stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            return ""
-
-    branch = run(["branch", "--show-current"])
-    status = run(["status", "--short"])
-    last_commit = run(["log", "-1", "--oneline"])
-    return {
-        "branch": branch,
-        "status": status or "(clean)",
-        "last_commit": last_commit or "(no commits yet)",
-    }
 
 
 def current_context_tokens(transcript_path):
@@ -358,27 +365,20 @@ def cmd_init(_args):
 
 
 def recent_handovers(conn, exclude_session_id, window_hours=HANDOVER_WINDOW_HOURS):
-    """Latest handover from each session (other than exclude_session_id) that
-    logged one within window_hours. Most-recent-session first. Returns a list
-    of (session_id, ts, parsed_content_dict).
+    """Latest handover row from each session (other than exclude_session_id)
+    that logged one within window_hours. Most-recent-session first.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
     rows = conn.execute(
-        "SELECT session_id, ts, content FROM log WHERE type = 'handover' AND ts >= ? "
-        "AND session_id != ? ORDER BY ts",
+        "SELECT session_id, ts, summary, next_steps, questions FROM handovers "
+        "WHERE ts >= ? AND session_id != ? ORDER BY ts",
         (cutoff, exclude_session_id),
     ).fetchall()
     latest = {}
-    for session_id, ts, content in rows:
-        latest[session_id] = (ts, content)  # ascending order -> last write wins per session
-    out = []
-    for session_id, (ts, content) in latest.items():
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            parsed = {"summary": content, "next": "", "questions": ""}
-        out.append((session_id, ts, parsed))
-    out.sort(key=lambda row: row[1], reverse=True)
+    for session_id, ts, summary, next_steps, questions in rows:
+        latest[session_id] = (ts, summary, next_steps, questions)  # ascending -> last write wins
+    out = list(latest.items())
+    out.sort(key=lambda row: row[1][0], reverse=True)
     return out
 
 
@@ -387,12 +387,12 @@ def format_handovers(handovers):
         return "No prior handover found (first session on this repo, or none in the last "\
             f"{HANDOVER_WINDOW_HOURS}h)."
     blocks = []
-    for session_id, ts, parsed in handovers:
+    for session_id, (ts, summary, next_steps, questions) in handovers:
         blocks.append(
             f"# Handover from session {session_id} (saved {ts})\n"
-            f"Summary: {parsed.get('summary', '')}\n"
-            f"Next steps: {parsed.get('next', '')}\n"
-            f"Open questions: {parsed.get('questions', '')}"
+            f"Summary: {summary}\n"
+            f"Next steps: {next_steps}\n"
+            f"Open questions: {questions or ''}"
         )
     return "\n\n".join(blocks)
 
@@ -401,11 +401,6 @@ def cmd_session_start(_args):
     data = read_stdin_json()
     session_id = data.get("session_id", "")
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO log (ts, session_id, type, content) VALUES (?, ?, 'session_start', ?)",
-        (now(), session_id, ""),
-    )
-    conn.commit()
     activity_note = session_activity_note(conn, session_id)
     todos_line = todos_note(conn)
     touch_session(conn, session_id)
@@ -437,38 +432,10 @@ def cmd_session_start(_args):
 def cmd_stop_check(_args):
     data = read_stdin_json()
     session_id = data.get("session_id", "")
-
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO log (ts, session_id, type, content) VALUES (?, ?, 'facts', ?)",
-        (now(), session_id, json.dumps(git_facts())),
-    )
-    conn.commit()
     touch_session(conn, session_id)
-    row = conn.execute(
-        "SELECT id FROM log WHERE type = 'handover' AND session_id = ? LIMIT 1",
-        (session_id,),
-    ).fetchone()
     conn.close()
-
-    if row:
-        print(json.dumps({"suppressOutput": True}))
-        return
-
-    print(json.dumps({
-        "decision": "block",
-        "reason": (
-            "No handover logged yet for this session. This is a one-time safety-net "
-            "checkpoint (so an abandoned session still leaves a note), NOT a signal "
-            "that the session is ending - it can fire after the very first turn. Log "
-            "one now, silently, then finish your response normally:\n"
-            f'python .claude/scripts/db.py log --session {session_id} '
-            '--summary "<what happened so far>" --next "<what to do next>" '
-            '[--questions "<open questions>"]\n'
-            "Do not tell the user the session is over or ready to close because of "
-            "this checkpoint - only say that if they actually asked to wrap up."
-        ),
-    }))
+    print(json.dumps({"suppressOutput": True}))
 
 
 def cmd_context_check(_args):
@@ -482,7 +449,7 @@ def cmd_context_check(_args):
         conn = get_conn()
         fired = {
             row[0] for row in conn.execute(
-                "SELECT content FROM log WHERE type = 'context_watch' AND session_id = ?",
+                "SELECT level FROM context_watch WHERE session_id = ?",
                 (session_id,),
             ).fetchall()
         }
@@ -498,7 +465,7 @@ def cmd_context_check(_args):
             return
 
         conn.execute(
-            "INSERT INTO log (ts, session_id, type, content) VALUES (?, ?, 'context_watch', ?)",
+            "INSERT INTO context_watch (ts, session_id, level) VALUES (?, ?, ?)",
             (now(), session_id, level),
         )
         conn.commit()
@@ -529,14 +496,10 @@ def cmd_context_check(_args):
 
 def cmd_log(args):
     conn = get_conn()
-    content = json.dumps({
-        "summary": args.summary,
-        "next": args.next,
-        "questions": args.questions or "",
-    })
     conn.execute(
-        "INSERT INTO log (ts, session_id, type, content) VALUES (?, ?, 'handover', ?)",
-        (now(), args.session, content),
+        "INSERT INTO handovers (ts, session_id, summary, next_steps, questions) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (now(), args.session, args.summary, args.next, args.questions or ""),
     )
     conn.commit()
     conn.close()
@@ -650,11 +613,8 @@ def cmd_prune(args):
     cutoff = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
     conn = get_conn()
     deleted = {}
-    for log_type in ("session_start", "facts", "context_watch"):
-        cur = conn.execute(
-            "DELETE FROM log WHERE type = ? AND ts < ?", (log_type, cutoff)
-        )
-        deleted[log_type] = cur.rowcount
+    cur = conn.execute("DELETE FROM context_watch WHERE ts < ?", (cutoff,))
+    deleted["context_watch"] = cur.rowcount
     cur = conn.execute("DELETE FROM sessions WHERE last_seen_ts < ?", (cutoff,))
     deleted["sessions"] = cur.rowcount
     conn.commit()

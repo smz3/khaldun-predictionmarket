@@ -5,15 +5,20 @@ infra (DB, handover, hooks) meant to be copied into other projects.
 
 ## Session continuity
 
-- `.claude/state.db` (SQLite, gitignored, local-only) holds session handover
-  notes. View it with the VS Code SQLite Viewer extension.
+- `.claude/state.db` (SQLite, gitignored, local-only) holds `handovers`,
+  `context_watch`, `sessions`, `todos` — real named columns, no JSON-blob
+  columns anywhere, so it's readable directly in the VS Code SQLite Viewer
+  extension without decoding anything.
 - SessionStart hook auto-injects the latest handover from *each* session that
   logged one in the last 24h (`HANDOVER_WINDOW_HOURS` in db.py), not just the
   single most recent row repo-wide — deliberate, since multiple parallel
   agent sessions can each finish and log around the same time, and an
   overall-latest query would silently hide every session but the last writer.
-- Stop hook blocks once if no handover was logged this session — follow the
-  command it prints (`.claude/scripts/db.py log --session ...`).
+- Handover logging is purely on-command — there is deliberately NO automatic
+  safety net. The Stop hook only bumps this session's heartbeat now; it does
+  not log anything or block. If a session gets abandoned without `/handover`
+  ever running, the next session sees nothing from it — accepted tradeoff for
+  keeping logging fully manual and not logging "every smallest thing."
 - **`/handover`** — say this (or just ask to "wrap up") to end a session
   cleanly: it saves uncommitted work via `git_safe.py`, writes a summary/
   next-steps/open-questions handover to state.db, and confirms it's safe to
@@ -45,9 +50,9 @@ infra (DB, handover, hooks) meant to be copied into other projects.
     overwritten — use it to record why something was rejected/closed),
     `todo-list`. `/handover` syncs this every time it runs.
 - DB helper: `.claude/scripts/db.py` (stdlib-only, run with `python`). Has a
-  `prune` subcommand (manual only) to delete old session_start/facts/
-  context_watch/dead-session rows once state.db grows large — handover and
-  todos rows are never pruned.
+  `prune` subcommand (manual only) to delete old context_watch/dead-session
+  rows once state.db grows large — handovers and todos rows are never
+  pruned.
 - UserPromptSubmit hook warns once at 100k tokens (soft) and once at 145k
   (hard) — a real reading of the transcript's own usage numbers, not a guess.
   On the hard warning: finish only what's in flight, log a handover, start a
