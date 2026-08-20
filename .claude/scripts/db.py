@@ -152,10 +152,14 @@ Subcommands:
                                                 hook.
   task-add --title T --category infra|app       Insert a task, status='open'.
     --priority 1-4 [--details D]                Priority is required, same
-                                                 as category. Prints its id
-                                                 (+ a bloat reminder once
-                                                 open+discussing reaches
-                                                 TASK_BLOAT_THRESHOLD).
+                                                 as category. --title must be
+                                                 <= TASK_TITLE_MAX_LEN chars
+                                                 (rejected with an error
+                                                 otherwise - move the extra
+                                                 text into --details instead).
+                                                 Prints its id (+ a bloat
+                                                 reminder once open+discussing
+                                                 reaches TASK_BLOAT_THRESHOLD).
   task-status --id N --status S [--note N]      Update a task's status
     [--priority 1-4] [--category infra|app]     ('open'|'discussing'|
                                                  'rejected'|'closed'). --note
@@ -163,6 +167,12 @@ Subcommands:
                                                  task_details, not a
                                                  replacement. Omit --priority/
                                                  --category to leave unchanged.
+  task-retitle --id N --title T                 Replace a task's title in
+                                                 place (same TASK_TITLE_MAX_LEN
+                                                 check as task-add). The only
+                                                 way to fix a bad title after
+                                                 creation - task-status never
+                                                 touches task_title.
   task-list [--status S1,S2,...]               Print tasks as JSON, sorted
     [--category infra|app]                     priority-first. Default
                                                 status filter: open,discussing.
@@ -201,6 +211,12 @@ LIKELY_DEAD_GRACE_MINUTES = 3
 # deprioritize before piling on more, instead of letting the list bloat
 # silently.
 TASK_BLOAT_THRESHOLD = 6
+# Hard cap on task_title length (task-add and task-retitle both enforce it).
+# Titles are meant to be scannable in the one-line SessionStart list
+# (tasks_note) - a title that runs long is really a description that
+# belongs in --details instead. Root cause of task #6: #3/#4/#5 had
+# description-length titles because nothing stopped it.
+TASK_TITLE_MAX_LEN = 60
 # SessionStart shows at most this many distinct sessions' latest undelivered
 # handover (current + 1 previous) - not a time window. Combined with the
 # delivered flag, a handover is shown once (to whichever session starts
@@ -700,7 +716,19 @@ def cmd_session_end(args):
         return
 
 
+def validate_task_title(title):
+    if len(title) > TASK_TITLE_MAX_LEN:
+        print(json.dumps({
+            "error": (
+                f"--title is {len(title)} chars, max is {TASK_TITLE_MAX_LEN}. "
+                f"Keep the title short and put the rest in --details."
+            )
+        }))
+        sys.exit(1)
+
+
 def cmd_task_add(args):
+    validate_task_title(args.title)
     conn = get_conn()
     ts = now()
     cur = conn.execute(
@@ -756,6 +784,23 @@ def cmd_task_status(args):
     if bloat:
         result["reminder"] = bloat
     print(json.dumps(result))
+
+
+def cmd_task_retitle(args):
+    validate_task_title(args.title)
+    conn = get_conn()
+    row = conn.execute("SELECT id FROM tasks WHERE id = ?", (args.id,)).fetchone()
+    if row is None:
+        print(json.dumps({"error": f"no task with id {args.id}"}))
+        conn.close()
+        sys.exit(1)
+    conn.execute(
+        "UPDATE tasks SET task_title = ?, updated_ts = ? WHERE id = ?",
+        (args.title, now(), args.id),
+    )
+    conn.commit()
+    conn.close()
+    print(json.dumps({"id": args.id, "task_title": args.title}))
 
 
 def cmd_task_list(args):
@@ -861,6 +906,11 @@ def main():
         "--category", choices=["infra", "app"], default=None, help="omit to leave unchanged"
     )
     task_status_p.set_defaults(func=cmd_task_status)
+
+    task_retitle_p = sub.add_parser("task-retitle")
+    task_retitle_p.add_argument("--id", type=int, required=True)
+    task_retitle_p.add_argument("--title", required=True)
+    task_retitle_p.set_defaults(func=cmd_task_retitle)
 
     task_list_p = sub.add_parser("task-list")
     task_list_p.add_argument("--status", default="")
