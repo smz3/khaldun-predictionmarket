@@ -170,7 +170,14 @@ DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 CONTEXT_SOFT = 100_000
 CONTEXT_HARD = 145_000
 CONTEXT_WINDOW = 200_000
-STALE_MINUTES = 30
+STALE_MINUTES = 5
+# Safe at 5 (down from 30) because touch_session now also runs on PostToolUse
+# (see cmd_context_check) - heartbeat has tool-call granularity, not just
+# once-per-turn, so a long-running turn keeps refreshing last_seen_ts instead
+# of going quiet until Stop. Was 30 specifically to tolerate the old
+# once-per-turn cadence; a real dead session sitting 'live' (and blocking
+# git_safe.py pushes) for up to 30min was the actual cost of that, confirmed
+# on session 6fcf78ff (happy-falcon) 2026-08-20.
 # A session whose last_seen_ts still equals its started_ts (i.e. it never
 # ticked past its first heartbeat) is only "possibly active" for this long -
 # past this, one frozen heartbeat is a stronger signal of an abandoned
@@ -549,11 +556,21 @@ def cmd_context_check(_args):
         data = read_stdin_json()
         hook_event_name = data.get("hook_event_name", "UserPromptSubmit")
         session_id = data.get("session_id", "")
-        tokens = current_context_tokens(data.get("transcript_path", ""))
-        if tokens is None:
-            return
 
         conn = get_conn()
+        # Piggyback the heartbeat on PostToolUse (this hook already fires
+        # there, see settings.json) so staleness has tool-call granularity,
+        # not just once-per-turn (Stop). Without this, STALE_MINUTES has to
+        # stay large to avoid falsely reaping a session mid-turn during a
+        # long tool-call sequence - with it, a genuinely dead session gets
+        # caught much faster without that false-positive risk.
+        touch_session(conn, session_id)
+
+        tokens = current_context_tokens(data.get("transcript_path", ""))
+        if tokens is None:
+            conn.close()
+            return
+
         fired = {
             row[0] for row in conn.execute(
                 "SELECT level FROM context_watch WHERE session_id = ?",
