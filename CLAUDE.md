@@ -27,11 +27,13 @@ infra (DB, handover, hooks) meant to be copied into other projects.
 - `sessions` table has a random `name` (adjective-noun, e.g. `brave-orca`) per
   session purely so it's easy to tell rows apart at a glance, and a `status`
   (`live`/`dead`). SessionEnd hook marks a session `dead` on explicit
-  exit/`/clear`/logout (used to delete the row; now kept for visibility).
-  Not confirmed to fire when a session is abandoned by jumping straight to a
-  new one without closing the old one — that case is instead covered by a
-  grace period (a session stuck on a single heartbeat for more than 3min
-  stops counting as "active"), independent of the `status` column.
+  exit/`/clear`/logout. For the case SessionEnd doesn't reliably catch —
+  abandoned by jumping straight to a new session without closing the old one
+  — `reap_stale_sessions()` (in `db.py`, called on every heartbeat) writes
+  `status='dead'` back to the row itself once it's been stale for
+  `STALE_MINUTES`, or stuck on a single heartbeat for more than
+  `LIKELY_DEAD_GRACE_MINUTES`. So `status` in the table is always trustworthy
+  on its own, not just a display-time filter.
 - **`todos` table** — the source of truth for cross-session work items
   (columns in order: id, status, priority, category, task_title,
   task_details, created_ts, updated_ts). Unlike handover's free-text "next
@@ -56,10 +58,15 @@ infra (DB, handover, hooks) meant to be copied into other projects.
   `prune` subcommand (manual only) to delete old context_watch/dead-session
   rows once state.db grows large — handovers and todos rows are never
   pruned.
-- UserPromptSubmit hook warns once at 100k tokens (soft) and once at 145k
-  (hard) — a real reading of the transcript's own usage numbers, not a guess.
-  On the hard warning: finish only what's in flight, log a handover, start a
-  fresh session.
+- Context tripwire warns once at 100k tokens (soft) and once at 145k (hard)
+  — a real reading of the transcript's own usage numbers, not a guess. Wired
+  to both UserPromptSubmit and PostToolUse, not just UserPromptSubmit alone
+  — a single long turn can run many tool calls with no new user prompt in
+  between, and checking only at prompt boundaries let usage blow straight
+  past 145k unnoticed in practice (once observed not caught until 195k).
+  PostToolUse re-checks after every tool call so mid-turn growth gets caught
+  too. On the hard warning: finish only what's in flight, log a handover,
+  start a fresh session.
 
 ## Git workflow
 

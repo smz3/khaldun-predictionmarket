@@ -20,10 +20,11 @@ Table: sessions(name, started_ts, last_seen_ts, status, session_id)
   stop-check still does). status = 'live' | 'dead': set to 'live' on every
   heartbeat, set to 'dead' by session-end (which used to delete the row
   outright - now it marks it dead instead, so closed sessions stay visible).
-  A session abandoned without SessionEnd firing stays 'live' forever by this
-  column alone - session_activity_note's timestamp-staleness check (see
-  STALE_MINUTES) is still what actually catches that case, status is a
-  separate, coarser signal ("was this ever cleanly closed").
+  A session abandoned without SessionEnd firing is caught by
+  reap_stale_sessions (called on every heartbeat, see STALE_MINUTES /
+  LIKELY_DEAD_GRACE_MINUTES), which writes status='dead' back to the row
+  itself - not just a display-time filter, so the table is trustworthy on
+  its own (e.g. read directly in the SQLite viewer).
 Table: context_watch(id, ts, session_id, level)
   level = 'soft' | 'hard'. One row per threshold crossed per session -
   written once each by context-check so the same token-usage nudge doesn't
@@ -67,13 +68,26 @@ Subcommands:
                                                 safety-net for an abandoned
                                                 session.
   context-check                                stdin: hook JSON (session_id,
-                                                transcript_path). UserPromptSubmit
-                                                hook. Reads the real token usage
-                                                of the last assistant turn from
-                                                the transcript; once per session,
-                                                prints a soft (100k) then a hard
-                                                (145k) handover-now nudge. Never
-                                                blocks; silent on any error.
+                                                transcript_path). Wired to BOTH
+                                                UserPromptSubmit and PostToolUse
+                                                - a single long turn can run many
+                                                tool calls with no new user
+                                                prompt in between, and
+                                                UserPromptSubmit alone would
+                                                never get a chance to run until
+                                                that turn finally ended, letting
+                                                usage blow straight past 145k
+                                                unnoticed (observed: not caught
+                                                until 195k). PostToolUse re-runs
+                                                the same check after every tool
+                                                call so growth mid-turn gets
+                                                seen too. Reads the real token
+                                                usage of the last assistant turn
+                                                from the transcript; once per
+                                                session, prints a soft (100k)
+                                                then a hard (145k) handover-now
+                                                nudge. Never blocks; silent on
+                                                any error.
   session-end                                  stdin: hook JSON (session_id).
                                                 SessionEnd hook. Deletes this
                                                 session's row from `sessions`
@@ -275,13 +289,35 @@ def random_session_name():
     return f"{random.choice(SESSION_NAME_ADJECTIVES)}-{random.choice(SESSION_NAME_NOUNS)}"
 
 
+def reap_stale_sessions(conn):
+    """Flip clearly-abandoned sessions to status='dead' in the DB itself,
+    not just in the transient note shown at SessionStart. Two cases:
+    - never ticked past its first heartbeat, and that heartbeat is older
+      than LIKELY_DEAD_GRACE_MINUTES (abandoned before finishing a turn);
+    - any session (ticked or not) whose last heartbeat is older than
+      STALE_MINUTES (no longer actively running).
+    Without this, a session closed by jumping straight to a new one (no
+    SessionEnd) stays 'live' forever - session_activity_note only filtered
+    it out of the printed note, it never corrected the stored status.
+    """
+    now_dt = datetime.now(timezone.utc)
+    stale_cutoff = (now_dt - timedelta(minutes=STALE_MINUTES)).isoformat()
+    grace_cutoff = (now_dt - timedelta(minutes=LIKELY_DEAD_GRACE_MINUTES)).isoformat()
+    conn.execute(
+        "UPDATE sessions SET status = 'dead' WHERE status = 'live' AND "
+        "(last_seen_ts < ? OR (last_seen_ts = started_ts AND started_ts < ?))",
+        (stale_cutoff, grace_cutoff),
+    )
+
+
 def touch_session(conn, session_id):
     """Upsert this session's heartbeat. name/started_ts set once (on insert);
     last_seen_ts and status always bumped to 'live' - session-end is the only
-    thing that ever sets status back to 'dead'.
+    other thing that sets status to 'dead' (reap_stale_sessions is the rest).
     """
     if not session_id:
         return
+    reap_stale_sessions(conn)
     ts = now()
     conn.execute(
         "INSERT INTO sessions (name, started_ts, last_seen_ts, status, session_id) "
