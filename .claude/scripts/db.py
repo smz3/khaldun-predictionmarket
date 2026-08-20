@@ -9,6 +9,15 @@ Table: sessions(session_id, started_ts, last_seen_ts)
   stop-check fires every turn). Used to warn a new session if another
   session was seen recently in this repo (see STALE_MINUTES) — crashed
   sessions age out instead of leaving a permanent false "active" flag.
+Table: todos(id, status, task_title, task_details, created_ts, updated_ts)
+  status = 'open' | 'discussing' | 'rejected' | 'closed' (CHECK-constrained).
+  The source of truth for cross-session work items — unlike handover's free-
+  text "next steps", a todo persists and keeps showing up at every
+  SessionStart until it's explicitly moved to rejected/closed, so nothing
+  gets silently dropped just because a later handover's prose didn't repeat
+  it. task_details doubles as the running note: status changes append a
+  timestamped note there (e.g. why something was rejected) rather than
+  overwriting the original description.
 
 Subcommands:
   init                                        create db/table if missing
@@ -52,6 +61,16 @@ Subcommands:
                                                 days (default 30). handover
                                                 rows are never deleted. Manual
                                                 only - not wired to a hook.
+  todo-add --title T [--details D]             Insert a todo, status='open'.
+                                                Prints its id.
+  todo-status --id N --status S [--note N]     Update a todo's status
+                                                ('open'|'discussing'|
+                                                'rejected'|'closed'). --note
+                                                is appended (timestamped) to
+                                                task_details, not a
+                                                replacement.
+  todo-list [--status S1,S2,...]               Print todos as JSON. Default
+                                                filter: open,discussing.
 """
 import argparse
 import json
@@ -92,6 +111,16 @@ def get_conn():
             session_id TEXT PRIMARY KEY,
             started_ts TEXT NOT NULL,
             last_seen_ts TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL CHECK(status IN ('open', 'discussing', 'rejected', 'closed')),
+            task_title TEXT NOT NULL,
+            task_details TEXT,
+            created_ts TEXT NOT NULL,
+            updated_ts TEXT NOT NULL
         )"""
     )
     return conn
@@ -250,6 +279,19 @@ def session_activity_note(conn, session_id):
     return note
 
 
+def todos_note(conn):
+    """Every todo still open or discussing, for SessionStart - so an item can't
+    silently drop off just because a later handover's prose didn't repeat it.
+    """
+    rows = conn.execute(
+        "SELECT id, status, task_title FROM todos WHERE status IN ('open', 'discussing') ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return "No open or discussing todos."
+    lines = "\n".join(f"  #{tid} [{status}] {title}" for tid, status, title in rows)
+    return f"{len(rows)} open/discussing todo(s):\n{lines}"
+
+
 def cmd_init(_args):
     get_conn().close()
 
@@ -264,6 +306,7 @@ def cmd_session_start(_args):
     )
     conn.commit()
     activity_note = session_activity_note(conn, session_id)
+    todos_line = todos_note(conn)
     touch_session(conn, session_id)
     row = conn.execute(
         "SELECT ts, content FROM log WHERE type = 'handover' ORDER BY id DESC LIMIT 1"
@@ -285,6 +328,7 @@ def cmd_session_start(_args):
             f"Open questions: {parsed.get('questions', '')}\n\n"
             f"{git_line}\n"
             f"{activity_note}\n\n"
+            f"{todos_line}\n\n"
             f"This session id: {session_id}\n"
             f"Before finishing this session, log a handover:\n"
             f'python .claude/scripts/db.py log --session {session_id} '
@@ -295,6 +339,7 @@ def cmd_session_start(_args):
             "No prior handover found (first session on this repo).\n"
             f"{git_line}\n"
             f"{activity_note}\n\n"
+            f"{todos_line}\n\n"
             f"This session id: {session_id}\n"
             f"Before finishing this session, log a handover:\n"
             f'python .claude/scripts/db.py log --session {session_id} '
@@ -428,6 +473,65 @@ def cmd_session_end(_args):
         return
 
 
+def cmd_todo_add(args):
+    conn = get_conn()
+    ts = now()
+    cur = conn.execute(
+        "INSERT INTO todos (status, task_title, task_details, created_ts, updated_ts) "
+        "VALUES ('open', ?, ?, ?, ?)",
+        (args.title, args.details or "", ts, ts),
+    )
+    conn.commit()
+    todo_id = cur.lastrowid
+    conn.close()
+    print(json.dumps({"id": todo_id, "status": "open", "task_title": args.title}))
+
+
+def cmd_todo_status(args):
+    conn = get_conn()
+    row = conn.execute("SELECT task_details FROM todos WHERE id = ?", (args.id,)).fetchone()
+    if row is None:
+        print(json.dumps({"error": f"no todo with id {args.id}"}))
+        conn.close()
+        sys.exit(1)
+
+    details = row[0] or ""
+    if args.note:
+        addition = f"[{now()} -> {args.status}] {args.note}"
+        details = f"{details}\n{addition}" if details else addition
+
+    conn.execute(
+        "UPDATE todos SET status = ?, task_details = ?, updated_ts = ? WHERE id = ?",
+        (args.status, details, now(), args.id),
+    )
+    conn.commit()
+    conn.close()
+    print(json.dumps({"id": args.id, "status": args.status}))
+
+
+def cmd_todo_list(args):
+    statuses = [s.strip() for s in (args.status or "open,discussing").split(",") if s.strip()]
+    placeholders = ",".join("?" for _ in statuses)
+    conn = get_conn()
+    rows = conn.execute(
+        f"SELECT id, status, task_title, task_details, created_ts, updated_ts FROM todos "
+        f"WHERE status IN ({placeholders}) ORDER BY id",
+        statuses,
+    ).fetchall()
+    conn.close()
+    print(json.dumps([
+        {
+            "id": r[0],
+            "status": r[1],
+            "task_title": r[2],
+            "task_details": r[3],
+            "created_ts": r[4],
+            "updated_ts": r[5],
+        }
+        for r in rows
+    ]))
+
+
 def cmd_prune(args):
     cutoff = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
     conn = get_conn()
@@ -471,6 +575,23 @@ def main():
     prune_p.add_argument("--days", type=int, default=30)
     prune_p.add_argument("--vacuum", action="store_true")
     prune_p.set_defaults(func=cmd_prune)
+
+    todo_add_p = sub.add_parser("todo-add")
+    todo_add_p.add_argument("--title", required=True)
+    todo_add_p.add_argument("--details", default="")
+    todo_add_p.set_defaults(func=cmd_todo_add)
+
+    todo_status_p = sub.add_parser("todo-status")
+    todo_status_p.add_argument("--id", type=int, required=True)
+    todo_status_p.add_argument(
+        "--status", required=True, choices=["open", "discussing", "rejected", "closed"]
+    )
+    todo_status_p.add_argument("--note", default="")
+    todo_status_p.set_defaults(func=cmd_todo_status)
+
+    todo_list_p = sub.add_parser("todo-list")
+    todo_list_p.add_argument("--status", default="")
+    todo_list_p.set_defaults(func=cmd_todo_list)
 
     args = parser.parse_args()
     args.func(args)

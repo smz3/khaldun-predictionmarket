@@ -20,10 +20,19 @@ infra (DB, handover, hooks) meant to be copied into other projects.
   to a new one without closing the old one — that case is instead covered by
   a grace period (a session stuck on a single heartbeat for more than 3min
   stops counting as "active").
+- **`todos` table** — the source of truth for cross-session work items
+  (columns: id, status, task_title, task_details, created_ts, updated_ts;
+  status is one of open/discussing/rejected/closed). Unlike handover's free-
+  text "next steps", a todo keeps showing up at every SessionStart until
+  it's explicitly closed/rejected — nothing gets silently dropped just
+  because a later handover's prose didn't repeat it. Manage via
+  `db.py todo-add`, `todo-status` (note gets appended, not overwritten —
+  use it to record why something was rejected/closed), `todo-list`.
+  `/handover` syncs this every time it runs.
 - DB helper: `.claude/scripts/db.py` (stdlib-only, run with `python`). Has a
   `prune` subcommand (manual only) to delete old session_start/facts/
-  context_watch/dead-session rows once state.db grows large — handover rows
-  are never pruned.
+  context_watch/dead-session rows once state.db grows large — handover and
+  todos rows are never pruned.
 - UserPromptSubmit hook warns once at 100k tokens (soft) and once at 145k
   (hard) — a real reading of the transcript's own usage numbers, not a guess.
   On the hard warning: finish only what's in flight, log a handover, start a
