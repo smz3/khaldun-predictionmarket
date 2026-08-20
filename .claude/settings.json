@@ -1,0 +1,34 @@
+{
+  "disableClaudeAiConnectors": true,
+  "skillOverrides": {
+    "recruiter": "off",
+    "agent-reach": "off",
+    "humanize-writing": "off"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/scripts/db.py session-start",
+            "shell": "bash",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/scripts/db.py stop-check",
+            "shell": "bash",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
