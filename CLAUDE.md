@@ -15,6 +15,15 @@ Prediction market app. Also carries the standard Claude-collaboration infra
   via `db.py task-add` / `task-status` / `task-list`. When the user hands you
   a new work item in conversation, log it immediately in the same turn -
   don't wait to be asked.
+- Before `task-add`, always run `task-list` first and check by *meaning*,
+  not just title text, whether an open/discussing task already covers it -
+  a root cause you just found is usually an update to the task that
+  prompted the investigation, not a new task. (Task #3 and #5 were the same
+  session-death bug filed twice because their titles shared almost no words
+  - "Fix session-end: ... tab-close" vs "Reap stale sessions ... touch_session"
+  - so don't rely on a text/fuzzy match here, actually read the list.) This
+  is a behavioral rule on purpose, not a code-level dedup check - matching
+  by meaning needs understanding, not a string-similarity heuristic.
 - Context tripwire: warns at 100k tokens (soft), 145k (hard). Checked on
   both UserPromptSubmit and PostToolUse.
 - `sessions.status` self-heals on your next heartbeat — safe to resume a
