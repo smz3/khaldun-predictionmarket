@@ -21,14 +21,25 @@ infra (DB, handover, hooks) meant to be copied into other projects.
   a grace period (a session stuck on a single heartbeat for more than 3min
   stops counting as "active").
 - **`todos` table** — the source of truth for cross-session work items
-  (columns: id, status, task_title, task_details, created_ts, updated_ts;
-  status is one of open/discussing/rejected/closed). Unlike handover's free-
-  text "next steps", a todo keeps showing up at every SessionStart until
-  it's explicitly closed/rejected — nothing gets silently dropped just
-  because a later handover's prose didn't repeat it. Manage via
-  `db.py todo-add`, `todo-status` (note gets appended, not overwritten —
-  use it to record why something was rejected/closed), `todo-list`.
-  `/handover` syncs this every time it runs.
+  (columns in order: id, status, priority, category, task_title,
+  task_details, created_ts, updated_ts). Unlike handover's free-text "next
+  steps", a todo keeps showing up at every SessionStart until it's
+  explicitly closed/rejected — nothing gets silently dropped just because a
+  later handover's prose didn't repeat it.
+  - `status`: open / discussing / rejected / closed.
+  - `priority`: NULL (untriaged, default) / 1 (blocking, do next) / 2
+    (important, soon) / 3 (worth doing) / 4 (someday) — our own plain-
+    language levels, deliberately not Eisenhower's quadrants (its
+    "delegate" category doesn't apply to a two-party repo).
+  - `category`: `infra` (the Claude-collaboration tooling) or `app` (the
+    prediction-market product) — required, since unlike priority it's
+    almost always obvious at creation time.
+  - Sort order everywhere is priority-first (untriaged last), then id.
+  - Soft cap: once open+discussing hits 6, `todo-add`/`todo-status`/
+    SessionStart print a reminder to triage — not a hard block.
+  - Manage via `db.py todo-add`, `todo-status` (note gets appended, not
+    overwritten — use it to record why something was rejected/closed),
+    `todo-list`. `/handover` syncs this every time it runs.
 - DB helper: `.claude/scripts/db.py` (stdlib-only, run with `python`). Has a
   `prune` subcommand (manual only) to delete old session_start/facts/
   context_watch/dead-session rows once state.db grows large — handover and

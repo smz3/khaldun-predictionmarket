@@ -9,15 +9,25 @@ Table: sessions(session_id, started_ts, last_seen_ts)
   stop-check fires every turn). Used to warn a new session if another
   session was seen recently in this repo (see STALE_MINUTES) — crashed
   sessions age out instead of leaving a permanent false "active" flag.
-Table: todos(id, status, task_title, task_details, created_ts, updated_ts)
+Table: todos(id, status, priority, category, task_title, task_details,
+             created_ts, updated_ts)
   status = 'open' | 'discussing' | 'rejected' | 'closed' (CHECK-constrained).
+  priority = NULL (untriaged, default) | 1 (blocking/do next) | 2 (important,
+  soon) | 3 (worth doing, no rush) | 4 (someday). Not Eisenhower's quadrants
+  on purpose — "delegate" doesn't mean anything in a two-party repo, so these
+  are our own plain-language levels instead.
+  category = 'infra' (the Claude-collaboration tooling, meant to be portable
+  to other projects) | 'app' (the prediction-market product itself). Required,
+  unlike priority, since it's almost always obvious at creation time.
   The source of truth for cross-session work items — unlike handover's free-
   text "next steps", a todo persists and keeps showing up at every
   SessionStart until it's explicitly moved to rejected/closed, so nothing
   gets silently dropped just because a later handover's prose didn't repeat
   it. task_details doubles as the running note: status changes append a
   timestamped note there (e.g. why something was rejected) rather than
-  overwriting the original description.
+  overwriting the original description. Sort order everywhere is priority
+  first (untriaged sinks last), then id. See TODO_BLOAT_THRESHOLD for the
+  soft-cap reminder on open+discussing count.
 
 Subcommands:
   init                                        create db/table if missing
@@ -61,16 +71,22 @@ Subcommands:
                                                 days (default 30). handover
                                                 rows are never deleted. Manual
                                                 only - not wired to a hook.
-  todo-add --title T [--details D]             Insert a todo, status='open'.
-                                                Prints its id.
+  todo-add --title T --category infra|app      Insert a todo, status='open'.
+    [--details D] [--priority 1-4]             Prints its id (+ a bloat
+                                                reminder once open+discussing
+                                                reaches TODO_BLOAT_THRESHOLD).
   todo-status --id N --status S [--note N]     Update a todo's status
-                                                ('open'|'discussing'|
+    [--priority 0-4] [--category infra|app]    ('open'|'discussing'|
                                                 'rejected'|'closed'). --note
                                                 is appended (timestamped) to
                                                 task_details, not a
-                                                replacement.
-  todo-list [--status S1,S2,...]               Print todos as JSON. Default
-                                                filter: open,discussing.
+                                                replacement. --priority 0
+                                                clears it back to untriaged;
+                                                omit either flag to leave
+                                                unchanged.
+  todo-list [--status S1,S2,...]               Print todos as JSON, sorted
+    [--category infra|app]                     priority-first. Default
+                                                status filter: open,discussing.
 """
 import argparse
 import json
@@ -93,6 +109,11 @@ STALE_MINUTES = 30
 # session (e.g. closed by jumping straight to a new session) than of a
 # session still working its first turn.
 LIKELY_DEAD_GRACE_MINUTES = 3
+# Soft cap, not a hard block: once open+discussing todos reach this count,
+# todo-add/todo-status/SessionStart surface a reminder to close/reject/
+# deprioritize before piling on more, instead of letting the list bloat
+# silently.
+TODO_BLOAT_THRESHOLD = 6
 
 
 def get_conn():
@@ -117,6 +138,8 @@ def get_conn():
         """CREATE TABLE IF NOT EXISTS todos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             status TEXT NOT NULL CHECK(status IN ('open', 'discussing', 'rejected', 'closed')),
+            priority INTEGER CHECK(priority IS NULL OR priority IN (1, 2, 3, 4)),
+            category TEXT NOT NULL CHECK(category IN ('infra', 'app')),
             task_title TEXT NOT NULL,
             task_details TEXT,
             created_ts TEXT NOT NULL,
@@ -279,17 +302,42 @@ def session_activity_note(conn, session_id):
     return note
 
 
+def check_todo_bloat(conn):
+    """Soft-cap reminder, not a block: nudge once open+discussing todos reach
+    TODO_BLOAT_THRESHOLD, so the list gets triaged before it grows unreadable.
+    """
+    count = conn.execute(
+        "SELECT COUNT(*) FROM todos WHERE status IN ('open', 'discussing')"
+    ).fetchone()[0]
+    if count < TODO_BLOAT_THRESHOLD:
+        return None
+    return (
+        f"{count} open/discussing todos - at or above the soft limit of "
+        f"{TODO_BLOAT_THRESHOLD}. Not a hard block, but close, reject, or "
+        f"deprioritize some before adding more."
+    )
+
+
 def todos_note(conn):
     """Every todo still open or discussing, for SessionStart - so an item can't
     silently drop off just because a later handover's prose didn't repeat it.
+    Sorted priority-first (untriaged sinks last), then by id.
     """
     rows = conn.execute(
-        "SELECT id, status, task_title FROM todos WHERE status IN ('open', 'discussing') ORDER BY id"
+        "SELECT id, status, priority, category, task_title FROM todos "
+        "WHERE status IN ('open', 'discussing') ORDER BY priority IS NULL, priority, id"
     ).fetchall()
     if not rows:
         return "No open or discussing todos."
-    lines = "\n".join(f"  #{tid} [{status}] {title}" for tid, status, title in rows)
-    return f"{len(rows)} open/discussing todo(s):\n{lines}"
+    lines = "\n".join(
+        f"  #{tid} [{status}] P{priority if priority is not None else '-'} [{category}] {title}"
+        for tid, status, priority, category, title in rows
+    )
+    note = f"{len(rows)} open/discussing todo(s):\n{lines}"
+    bloat = check_todo_bloat(conn)
+    if bloat:
+        note = f"[REMINDER] {bloat}\n{note}"
+    return note
 
 
 def cmd_init(_args):
@@ -477,56 +525,86 @@ def cmd_todo_add(args):
     conn = get_conn()
     ts = now()
     cur = conn.execute(
-        "INSERT INTO todos (status, task_title, task_details, created_ts, updated_ts) "
-        "VALUES ('open', ?, ?, ?, ?)",
-        (args.title, args.details or "", ts, ts),
+        "INSERT INTO todos (status, priority, category, task_title, task_details, created_ts, updated_ts) "
+        "VALUES ('open', ?, ?, ?, ?, ?, ?)",
+        (args.priority, args.category, args.title, args.details or "", ts, ts),
     )
     conn.commit()
     todo_id = cur.lastrowid
+    bloat = check_todo_bloat(conn)
     conn.close()
-    print(json.dumps({"id": todo_id, "status": "open", "task_title": args.title}))
+    result = {
+        "id": todo_id,
+        "status": "open",
+        "priority": args.priority,
+        "category": args.category,
+        "task_title": args.title,
+    }
+    if bloat:
+        result["reminder"] = bloat
+    print(json.dumps(result))
 
 
 def cmd_todo_status(args):
     conn = get_conn()
-    row = conn.execute("SELECT task_details FROM todos WHERE id = ?", (args.id,)).fetchone()
+    row = conn.execute(
+        "SELECT task_details, priority, category FROM todos WHERE id = ?", (args.id,)
+    ).fetchone()
     if row is None:
         print(json.dumps({"error": f"no todo with id {args.id}"}))
         conn.close()
         sys.exit(1)
 
-    details = row[0] or ""
+    details, priority, category = row
+    details = details or ""
     if args.note:
         addition = f"[{now()} -> {args.status}] {args.note}"
         details = f"{details}\n{addition}" if details else addition
 
+    if args.priority is not None:
+        priority = None if args.priority == 0 else args.priority
+    if args.category is not None:
+        category = args.category
+
     conn.execute(
-        "UPDATE todos SET status = ?, task_details = ?, updated_ts = ? WHERE id = ?",
-        (args.status, details, now(), args.id),
+        "UPDATE todos SET status = ?, priority = ?, category = ?, task_details = ?, updated_ts = ? WHERE id = ?",
+        (args.status, priority, category, details, now(), args.id),
     )
     conn.commit()
+    bloat = check_todo_bloat(conn)
     conn.close()
-    print(json.dumps({"id": args.id, "status": args.status}))
+    result = {"id": args.id, "status": args.status, "priority": priority, "category": category}
+    if bloat:
+        result["reminder"] = bloat
+    print(json.dumps(result))
 
 
 def cmd_todo_list(args):
     statuses = [s.strip() for s in (args.status or "open,discussing").split(",") if s.strip()]
     placeholders = ",".join("?" for _ in statuses)
+    params = list(statuses)
+    category_clause = ""
+    if args.category:
+        category_clause = " AND category = ?"
+        params.append(args.category)
     conn = get_conn()
     rows = conn.execute(
-        f"SELECT id, status, task_title, task_details, created_ts, updated_ts FROM todos "
-        f"WHERE status IN ({placeholders}) ORDER BY id",
-        statuses,
+        f"SELECT id, status, priority, category, task_title, task_details, created_ts, updated_ts "
+        f"FROM todos WHERE status IN ({placeholders}){category_clause} "
+        f"ORDER BY priority IS NULL, priority, id",
+        params,
     ).fetchall()
     conn.close()
     print(json.dumps([
         {
             "id": r[0],
             "status": r[1],
-            "task_title": r[2],
-            "task_details": r[3],
-            "created_ts": r[4],
-            "updated_ts": r[5],
+            "priority": r[2],
+            "category": r[3],
+            "task_title": r[4],
+            "task_details": r[5],
+            "created_ts": r[6],
+            "updated_ts": r[7],
         }
         for r in rows
     ]))
@@ -579,6 +657,8 @@ def main():
     todo_add_p = sub.add_parser("todo-add")
     todo_add_p.add_argument("--title", required=True)
     todo_add_p.add_argument("--details", default="")
+    todo_add_p.add_argument("--category", required=True, choices=["infra", "app"])
+    todo_add_p.add_argument("--priority", type=int, choices=[1, 2, 3, 4], default=None)
     todo_add_p.set_defaults(func=cmd_todo_add)
 
     todo_status_p = sub.add_parser("todo-status")
@@ -587,10 +667,18 @@ def main():
         "--status", required=True, choices=["open", "discussing", "rejected", "closed"]
     )
     todo_status_p.add_argument("--note", default="")
+    todo_status_p.add_argument(
+        "--priority", type=int, choices=[0, 1, 2, 3, 4], default=None,
+        help="0 clears priority back to untriaged; omit to leave unchanged",
+    )
+    todo_status_p.add_argument(
+        "--category", choices=["infra", "app"], default=None, help="omit to leave unchanged"
+    )
     todo_status_p.set_defaults(func=cmd_todo_status)
 
     todo_list_p = sub.add_parser("todo-list")
     todo_list_p.add_argument("--status", default="")
+    todo_list_p.add_argument("--category", choices=["infra", "app"], default=None)
     todo_list_p.set_defaults(func=cmd_todo_list)
 
     args = parser.parse_args()
