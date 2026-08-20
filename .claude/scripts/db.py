@@ -23,10 +23,15 @@ Table: sessions(name, started_ts, last_seen_ts, status, session_id)
   heartbeat, set to 'dead' by session-end (which used to delete the row
   outright - now it marks it dead instead, so closed sessions stay visible).
   A session abandoned without SessionEnd firing is caught by
-  reap_stale_sessions (called on every heartbeat, see STALE_MINUTES /
+  reap_stale_sessions (called on every heartbeat via touch_session, AND at
+  the top of session_activity_note - see STALE_MINUTES /
   LIKELY_DEAD_GRACE_MINUTES), which writes status='dead' back to the row
   itself - not just a display-time filter, so the table is trustworthy on
-  its own (e.g. read directly in the SQLite viewer).
+  its own (e.g. read directly in the SQLite viewer). The
+  session_activity_note call matters specifically because git_safe.py's
+  push guard reads that function directly and never calls touch_session -
+  without a reap there too, a dead session's row could read 'live' forever
+  regardless of wall-clock time (task #3).
 Table: context_watch(id, ts, session_id, level)
   level = 'soft' | 'hard'. One row per threshold crossed per session -
   written once each by context-check so the same token-usage nudge doesn't
@@ -421,6 +426,13 @@ def session_activity_note(conn, session_id):
     always abandoned (e.g. closed by jumping straight to a new session), not
     left mid-turn.
     """
+    # Reap first: this is the only path git_safe.py's push guard reads
+    # (it calls this function directly, never touch_session()), so without
+    # reaping here a dead session's row can read 'live' forever regardless
+    # of wall-clock time, until some unrelated session's heartbeat happens
+    # to reap it first. Root cause of task #3's failed live-test.
+    reap_stale_sessions(conn)
+    conn.commit()
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)
     dead_grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=LIKELY_DEAD_GRACE_MINUTES)
     rows = conn.execute(
