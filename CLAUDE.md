@@ -27,14 +27,14 @@ infra (DB, handover, hooks) meant to be copied into other projects.
   explicitly closed/rejected — nothing gets silently dropped just because a
   later handover's prose didn't repeat it.
   - `status`: open / discussing / rejected / closed.
-  - `priority`: NULL (untriaged, default) / 1 (blocking, do next) / 2
-    (important, soon) / 3 (worth doing) / 4 (someday) — our own plain-
-    language levels, deliberately not Eisenhower's quadrants (its
-    "delegate" category doesn't apply to a two-party repo).
+  - `priority`: 1 (blocking, do next) / 2 (important, soon) / 3 (worth
+    doing) / 4 (someday) — required (NOT NULL, DB-constrained), no
+    untriaged state; our own plain-language levels, deliberately not
+    Eisenhower's quadrants (its "delegate" category doesn't apply to a
+    two-party repo).
   - `category`: `infra` (the Claude-collaboration tooling) or `app` (the
-    prediction-market product) — required, since unlike priority it's
-    almost always obvious at creation time.
-  - Sort order everywhere is priority-first (untriaged last), then id.
+    prediction-market product) — required, same as priority.
+  - Sort order everywhere is priority-first, then id.
   - Soft cap: once open+discussing hits 6, `todo-add`/`todo-status`/
     SessionStart print a reminder to triage — not a hard block.
   - Manage via `db.py todo-add`, `todo-status` (note gets appended, not

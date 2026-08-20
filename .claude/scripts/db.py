@@ -12,22 +12,23 @@ Table: sessions(session_id, started_ts, last_seen_ts)
 Table: todos(id, status, priority, category, task_title, task_details,
              created_ts, updated_ts)
   status = 'open' | 'discussing' | 'rejected' | 'closed' (CHECK-constrained).
-  priority = NULL (untriaged, default) | 1 (blocking/do next) | 2 (important,
-  soon) | 3 (worth doing, no rush) | 4 (someday). Not Eisenhower's quadrants
-  on purpose — "delegate" doesn't mean anything in a two-party repo, so these
-  are our own plain-language levels instead.
+  priority = 1 (blocking/do next) | 2 (important, soon) | 3 (worth doing, no
+  rush) | 4 (someday). Required (NOT NULL, CHECK-constrained) - no untriaged
+  state, every todo gets a real priority at creation. Not Eisenhower's
+  quadrants on purpose — "delegate" doesn't mean anything in a two-party
+  repo, so these are our own plain-language levels instead.
   category = 'infra' (the Claude-collaboration tooling, meant to be portable
   to other projects) | 'app' (the prediction-market product itself). Required,
-  unlike priority, since it's almost always obvious at creation time.
+  same as priority.
   The source of truth for cross-session work items — unlike handover's free-
   text "next steps", a todo persists and keeps showing up at every
   SessionStart until it's explicitly moved to rejected/closed, so nothing
   gets silently dropped just because a later handover's prose didn't repeat
   it. task_details doubles as the running note: status changes append a
   timestamped note there (e.g. why something was rejected) rather than
-  overwriting the original description. Sort order everywhere is priority
-  first (untriaged sinks last), then id. See TODO_BLOAT_THRESHOLD for the
-  soft-cap reminder on open+discussing count.
+  overwriting the original description. Sort order everywhere is priority,
+  then id. See TODO_BLOAT_THRESHOLD for the soft-cap reminder on
+  open+discussing count.
 
 Subcommands:
   init                                        create db/table if missing
@@ -71,19 +72,19 @@ Subcommands:
                                                 days (default 30). handover
                                                 rows are never deleted. Manual
                                                 only - not wired to a hook.
-  todo-add --title T --category infra|app      Insert a todo, status='open'.
-    [--details D] [--priority 1-4]             Prints its id (+ a bloat
-                                                reminder once open+discussing
-                                                reaches TODO_BLOAT_THRESHOLD).
-  todo-status --id N --status S [--note N]     Update a todo's status
-    [--priority 0-4] [--category infra|app]    ('open'|'discussing'|
-                                                'rejected'|'closed'). --note
-                                                is appended (timestamped) to
-                                                task_details, not a
-                                                replacement. --priority 0
-                                                clears it back to untriaged;
-                                                omit either flag to leave
-                                                unchanged.
+  todo-add --title T --category infra|app       Insert a todo, status='open'.
+    --priority 1-4 [--details D]                Priority is required, same
+                                                 as category. Prints its id
+                                                 (+ a bloat reminder once
+                                                 open+discussing reaches
+                                                 TODO_BLOAT_THRESHOLD).
+  todo-status --id N --status S [--note N]      Update a todo's status
+    [--priority 1-4] [--category infra|app]     ('open'|'discussing'|
+                                                 'rejected'|'closed'). --note
+                                                 is appended (timestamped) to
+                                                 task_details, not a
+                                                 replacement. Omit --priority/
+                                                 --category to leave unchanged.
   todo-list [--status S1,S2,...]               Print todos as JSON, sorted
     [--category infra|app]                     priority-first. Default
                                                 status filter: open,discussing.
@@ -138,7 +139,7 @@ def get_conn():
         """CREATE TABLE IF NOT EXISTS todos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             status TEXT NOT NULL CHECK(status IN ('open', 'discussing', 'rejected', 'closed')),
-            priority INTEGER CHECK(priority IS NULL OR priority IN (1, 2, 3, 4)),
+            priority INTEGER NOT NULL CHECK(priority IN (1, 2, 3, 4)),
             category TEXT NOT NULL CHECK(category IN ('infra', 'app')),
             task_title TEXT NOT NULL,
             task_details TEXT,
@@ -321,16 +322,16 @@ def check_todo_bloat(conn):
 def todos_note(conn):
     """Every todo still open or discussing, for SessionStart - so an item can't
     silently drop off just because a later handover's prose didn't repeat it.
-    Sorted priority-first (untriaged sinks last), then by id.
+    Sorted priority-first, then by id.
     """
     rows = conn.execute(
         "SELECT id, status, priority, category, task_title FROM todos "
-        "WHERE status IN ('open', 'discussing') ORDER BY priority IS NULL, priority, id"
+        "WHERE status IN ('open', 'discussing') ORDER BY priority, id"
     ).fetchall()
     if not rows:
         return "No open or discussing todos."
     lines = "\n".join(
-        f"  #{tid} [{status}] P{priority if priority is not None else '-'} [{category}] {title}"
+        f"  #{tid} [{status}] P{priority} [{category}] {title}"
         for tid, status, priority, category, title in rows
     )
     note = f"{len(rows)} open/discussing todo(s):\n{lines}"
@@ -562,7 +563,7 @@ def cmd_todo_status(args):
         details = f"{details}\n{addition}" if details else addition
 
     if args.priority is not None:
-        priority = None if args.priority == 0 else args.priority
+        priority = args.priority
     if args.category is not None:
         category = args.category
 
@@ -591,7 +592,7 @@ def cmd_todo_list(args):
     rows = conn.execute(
         f"SELECT id, status, priority, category, task_title, task_details, created_ts, updated_ts "
         f"FROM todos WHERE status IN ({placeholders}){category_clause} "
-        f"ORDER BY priority IS NULL, priority, id",
+        f"ORDER BY priority, id",
         params,
     ).fetchall()
     conn.close()
@@ -658,7 +659,7 @@ def main():
     todo_add_p.add_argument("--title", required=True)
     todo_add_p.add_argument("--details", default="")
     todo_add_p.add_argument("--category", required=True, choices=["infra", "app"])
-    todo_add_p.add_argument("--priority", type=int, choices=[1, 2, 3, 4], default=None)
+    todo_add_p.add_argument("--priority", type=int, required=True, choices=[1, 2, 3, 4])
     todo_add_p.set_defaults(func=cmd_todo_add)
 
     todo_status_p = sub.add_parser("todo-status")
@@ -668,8 +669,8 @@ def main():
     )
     todo_status_p.add_argument("--note", default="")
     todo_status_p.add_argument(
-        "--priority", type=int, choices=[0, 1, 2, 3, 4], default=None,
-        help="0 clears priority back to untriaged; omit to leave unchanged",
+        "--priority", type=int, choices=[1, 2, 3, 4], default=None,
+        help="omit to leave unchanged",
     )
     todo_status_p.add_argument(
         "--category", choices=["infra", "app"], default=None, help="omit to leave unchanged"
