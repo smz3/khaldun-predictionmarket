@@ -24,7 +24,10 @@ Subcommands:
                           fresh in state.db (see db.py session_activity_note).
                           Without --session, that last check degrades to a
                           warning instead of a block, since self vs. other
-                          can't be told apart.
+                          can't be told apart. --override-session-guard
+                          downgrades that block to a logged warning, for
+                          when a human has confirmed the other session is
+                          actually dead.
 """
 import argparse
 import fnmatch
@@ -194,8 +197,11 @@ def cmd_push(args):
         conn.close()
         if args.session:
             if not note.startswith("No other sessions"):
-                print(f"Refusing to push to {branch}: {note}")
-                sys.exit(1)
+                if args.override_session_guard:
+                    warnings.append(f"[override] proceeding despite: {note}")
+                else:
+                    print(f"Refusing to push to {branch}: {note}")
+                    sys.exit(1)
         else:
             warnings.append(
                 f"[warn] pushing to {branch} without --session - cannot tell "
@@ -233,6 +239,7 @@ def main():
     push_p = sub.add_parser("push")
     push_p.add_argument("--yes", action="store_true")
     push_p.add_argument("--session", default="")
+    push_p.add_argument("--override-session-guard", action="store_true")
     push_p.set_defaults(func=cmd_push)
 
     args = parser.parse_args()

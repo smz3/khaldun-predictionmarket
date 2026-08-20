@@ -28,6 +28,22 @@ Subcommands:
                                                 prints a soft (100k) then a hard
                                                 (145k) handover-now nudge. Never
                                                 blocks; silent on any error.
+  session-end                                  stdin: hook JSON (session_id).
+                                                SessionEnd hook. Deletes this
+                                                session's row from `sessions`
+                                                immediately, so it stops
+                                                counting as active. Confirmed
+                                                to fire on explicit exit,
+                                                /clear, and logout; NOT
+                                                confirmed to fire when an IDE
+                                                tab is abandoned by jumping
+                                                straight to a new session -
+                                                that gap is instead covered
+                                                by the single-heartbeat
+                                                grace period in
+                                                session_activity_note (see
+                                                LIKELY_DEAD_GRACE_MINUTES).
+                                                Silent; never blocks.
   log --session ID --summary S --next N [--questions Q]
                                                 Insert a handover row.
   prune [--days N] [--vacuum]                  Delete session_start/facts/
@@ -52,6 +68,12 @@ CONTEXT_SOFT = 100_000
 CONTEXT_HARD = 145_000
 CONTEXT_WINDOW = 200_000
 STALE_MINUTES = 30
+# A session whose last_seen_ts still equals its started_ts (i.e. it never
+# ticked past its first heartbeat) is only "possibly active" for this long -
+# past this, one frozen heartbeat is a stronger signal of an abandoned
+# session (e.g. closed by jumping straight to a new session) than of a
+# session still working its first turn.
+LIKELY_DEAD_GRACE_MINUTES = 3
 
 
 def get_conn():
@@ -172,30 +194,60 @@ def touch_session(conn, session_id):
 
 
 def session_activity_note(conn, session_id):
-    """Other sessions whose heartbeat is fresher than STALE_MINUTES, excluding this one."""
+    """Other sessions whose heartbeat is fresher than STALE_MINUTES, excluding this one.
+
+    A session that never ticked past its first heartbeat (last_seen_ts ==
+    started_ts) is downgraded to "likely dead" - and excluded from the
+    blocking count - once it's older than LIKELY_DEAD_GRACE_MINUTES. Real
+    sessions accumulate a Stop-hook tick roughly once per turn; a session
+    stuck on exactly one heartbeat for several minutes was almost always
+    abandoned (e.g. closed by jumping straight to a new session), not left
+    mid-turn.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)
+    dead_grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=LIKELY_DEAD_GRACE_MINUTES)
     rows = conn.execute(
-        "SELECT session_id, last_seen_ts FROM sessions WHERE session_id != ?",
+        "SELECT session_id, started_ts, last_seen_ts FROM sessions WHERE session_id != ?",
         (session_id,),
     ).fetchall()
 
-    active = []
-    for sid, last_seen in rows:
+    active, likely_dead = [], []
+    for sid, started, last_seen in rows:
         try:
-            ts = datetime.fromisoformat(last_seen)
+            last_ts = datetime.fromisoformat(last_seen)
+            start_ts = datetime.fromisoformat(started)
         except ValueError:
             continue
-        if ts >= cutoff:
+        if last_ts < cutoff:
+            continue
+        never_ticked = last_seen == started
+        if never_ticked and start_ts < dead_grace_cutoff:
+            likely_dead.append((sid, last_seen))
+        else:
             active.append((sid, last_seen))
 
     if not active:
-        return f"No other sessions seen active in this repo in the last {STALE_MINUTES}min."
+        base = f"No other sessions seen active in this repo in the last {STALE_MINUTES}min."
+        if likely_dead:
+            lines = "\n".join(f"  {sid} (last seen {ts})" for sid, ts in likely_dead)
+            base += (
+                f" ({len(likely_dead)} session(s) have a single stale heartbeat and "
+                f"are treated as likely-dead, not blocking:\n{lines})"
+            )
+        return base
 
     lines = "\n".join(f"  {sid} (last seen {ts})" for sid, ts in active)
-    return (
+    note = (
         f"{len(active)} other session(s) possibly active in this repo (heartbeat "
         f"within {STALE_MINUTES}min) - check before editing outside a worktree:\n{lines}"
     )
+    if likely_dead:
+        dead_lines = "\n".join(f"  {sid} (last seen {ts})" for sid, ts in likely_dead)
+        note += (
+            f"\n{len(likely_dead)} other session(s) look likely-dead (single stale "
+            f"heartbeat, not counted above):\n{dead_lines}"
+        )
+    return note
 
 
 def cmd_init(_args):
@@ -362,6 +414,20 @@ def cmd_log(args):
     print(json.dumps({"systemMessage": "Handover logged."}))
 
 
+def cmd_session_end(_args):
+    try:
+        data = read_stdin_json()
+        session_id = data.get("session_id", "")
+        if not session_id:
+            return
+        conn = get_conn()
+        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        return
+
+
 def cmd_prune(args):
     cutoff = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat()
     conn = get_conn()
@@ -392,6 +458,7 @@ def main():
     sub.add_parser("session-start").set_defaults(func=cmd_session_start)
     sub.add_parser("stop-check").set_defaults(func=cmd_stop_check)
     sub.add_parser("context-check").set_defaults(func=cmd_context_check)
+    sub.add_parser("session-end").set_defaults(func=cmd_session_end)
 
     log_p = sub.add_parser("log")
     log_p.add_argument("--session", required=True)

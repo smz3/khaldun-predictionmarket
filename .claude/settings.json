@@ -41,6 +41,18 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/scripts/db.py session-end",
+            "shell": "bash",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
