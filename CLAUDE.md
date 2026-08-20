@@ -26,8 +26,10 @@ Prediction market app. Also carries the standard Claude-collaboration infra
 - Worktree done -> merge into `main`, remove the worktree.
 - Commit/push via `.claude/scripts/git_safe.py`, not raw `git commit`/
   `git push`. Auto-push after every commit, no confirmation needed.
-- Push takes `--session <id>`. Use `--override-session-guard` only once
-  you've confirmed the flagged session is actually dead.
+- Push takes `--session <id>`. If it's blocked on a session you know is
+  actually closed, prefer `db.py session-end --session <id>` to mark it
+  dead once (clears the guard for good) over repeating
+  `--override-session-guard` on every push.
 
 ## Stack
 

@@ -89,22 +89,26 @@ Subcommands:
                                                 then a hard (145k) handover-now
                                                 nudge. Never blocks; silent on
                                                 any error.
-  session-end                                  stdin: hook JSON (session_id).
-                                                SessionEnd hook. Deletes this
-                                                session's row from `sessions`
-                                                immediately, so it stops
-                                                counting as active. Confirmed
-                                                to fire on explicit exit,
-                                                /clear, and logout; NOT
-                                                confirmed to fire when an IDE
-                                                tab is abandoned by jumping
-                                                straight to a new session -
-                                                that gap is instead covered
-                                                by the single-heartbeat
-                                                grace period in
-                                                session_activity_note (see
-                                                LIKELY_DEAD_GRACE_MINUTES).
-                                                Silent; never blocks.
+  session-end [--session ID]                   No --session: stdin hook JSON
+                                                (session_id) - SessionEnd
+                                                hook, marks that session's row
+                                                dead immediately. Confirmed to
+                                                fire on explicit exit, /clear,
+                                                and logout; NOT confirmed to
+                                                fire when an IDE tab is
+                                                abandoned by jumping straight
+                                                to a new session - that gap is
+                                                covered by reap_stale_sessions
+                                                instead. With --session ID:
+                                                manual escape hatch - mark a
+                                                specific session dead on the
+                                                spot (e.g. to unblock
+                                                git_safe.py's push guard
+                                                without waiting out
+                                                STALE_MINUTES or reaching for
+                                                --override-session-guard).
+                                                Silent on the hook path; never
+                                                blocks.
   log --session ID --summary S --next N [--questions Q]
                                                 Insert a handover row. The
                                                 only way a handover ever gets
@@ -525,6 +529,7 @@ def cmd_stop_check(_args):
 def cmd_context_check(_args):
     try:
         data = read_stdin_json()
+        hook_event_name = data.get("hook_event_name", "UserPromptSubmit")
         session_id = data.get("session_id", "")
         tokens = current_context_tokens(data.get("transcript_path", ""))
         if tokens is None:
@@ -562,18 +567,28 @@ def cmd_context_check(_args):
             f'--summary "..." --next "..." [--questions "..."]'
         )
         if level == "soft":
-            print(
+            message = (
                 f"[CONTEXT WATCH] ~{k}k tokens (~{pct}% of {CONTEXT_WINDOW // 1000}k). "
                 f"SOFT threshold ({CONTEXT_SOFT // 1000}k) crossed - start wrapping up, "
                 f"log a handover at the next natural stopping point:\n{log_cmd}"
             )
         else:
-            print(
+            message = (
                 f"[CONTEXT WATCH] ~{k}k tokens (~{pct}% of {CONTEXT_WINDOW // 1000}k). "
                 f"HARD threshold ({CONTEXT_HARD // 1000}k) crossed - auto-compact fires "
                 f"around 160k. Finish only what's in flight, then log a handover now and "
                 f"start a fresh session:\n{log_cmd}"
             )
+        # Plain stdout only auto-injects into model context for
+        # UserPromptSubmit. PostToolUse (also wired to this check, see
+        # settings.json) silently drops plain text - needs this JSON form
+        # or the warning never reaches the model at all.
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": hook_event_name,
+                "additionalContext": message,
+            }
+        }))
     except Exception:
         return
 
@@ -590,16 +605,20 @@ def cmd_log(args):
     print(json.dumps({"systemMessage": "Handover logged."}))
 
 
-def cmd_session_end(_args):
+def cmd_session_end(args):
     try:
-        data = read_stdin_json()
-        session_id = data.get("session_id", "")
+        session_id = args.session
+        if not session_id:
+            data = read_stdin_json()
+            session_id = data.get("session_id", "")
         if not session_id:
             return
         conn = get_conn()
         conn.execute("UPDATE sessions SET status = 'dead' WHERE session_id = ?", (session_id,))
         conn.commit()
         conn.close()
+        if args.session:
+            print(json.dumps({"session_id": session_id, "status": "dead"}))
     except Exception:
         return
 
@@ -720,7 +739,15 @@ def main():
     sub.add_parser("session-start").set_defaults(func=cmd_session_start)
     sub.add_parser("stop-check").set_defaults(func=cmd_stop_check)
     sub.add_parser("context-check").set_defaults(func=cmd_context_check)
-    sub.add_parser("session-end").set_defaults(func=cmd_session_end)
+
+    session_end_p = sub.add_parser("session-end")
+    session_end_p.add_argument(
+        "--session", default=None,
+        help="mark this session_id dead directly - manual escape hatch for "
+             "when SessionEnd didn't fire and you know for a fact the "
+             "session is closed. Omit to use the hook's stdin JSON instead.",
+    )
+    session_end_p.set_defaults(func=cmd_session_end)
 
     log_p = sub.add_parser("log")
     log_p.add_argument("--session", required=True)
