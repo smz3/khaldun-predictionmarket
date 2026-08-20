@@ -8,7 +8,8 @@ Prediction market app. Also carries the standard Claude-collaboration infra
 - `.claude/state.db` (SQLite, gitignored) holds `handovers`, `context_watch`,
   `sessions`, `todos`. Full schema + rationale: docstring in
   `.claude/scripts/db.py`.
-- SessionStart shows the latest handover per session (last 24h).
+- SessionStart shows the current + 1 previous undelivered handover, then
+  marks them delivered so they don't repeat.
 - `/handover` — wrap up a session: saves work, syncs todos, logs a handover.
 - `todos` table is the source of truth for cross-session work items. Manage
   via `db.py todo-add` / `todo-status` / `todo-list`.

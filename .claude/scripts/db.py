@@ -1,16 +1,17 @@
 """
 Local state DB for session continuity. Stdlib only (sqlite3), no deps.
 
-Table: handovers(id, ts, summary, next_steps, questions, session_id)
+Table: handovers(id, ts, summary, next_steps, questions, session_id, delivered)
   Plain columns, no JSON - written ONLY on-command (the `log` subcommand,
   normally via the /handover skill), never automatically. A session that
   ends without the user saying "handover" leaves no row here - that's
   deliberate, not a bug (see cmd_stop_check). One row per log call, not one
   per session - a session can log more than once. SessionStart surfaces the
-  latest row from EACH session that logged one within HANDOVER_WINDOW_HOURS
-  (not just the single latest row overall), so parallel agent sessions
-  finishing around the same time don't shadow each other's context. Never
-  pruned.
+  latest row from up to HANDOVER_SHOW_COUNT distinct sessions that haven't
+  been delivered yet (delivered=0), most recent first, then marks exactly
+  those rows delivered=1 - so a handover is replayed to the next session
+  once and never again, instead of re-showing the same stale context to
+  every SessionStart for a rolling time window. Never pruned.
 Table: sessions(name, started_ts, last_seen_ts, status, session_id)
   One row per session, updated in place. name is a random adjective-noun
   label assigned once on first touch, purely so a human can tell sessions
@@ -55,8 +56,8 @@ Subcommands:
   session-start                                stdin: hook JSON (session_id).
                                                 Prints SessionStart
                                                 hookSpecificOutput JSON with
-                                                recent handovers (see
-                                                HANDOVER_WINDOW_HOURS).
+                                                undelivered handovers (see
+                                                HANDOVER_SHOW_COUNT).
   stop-check                                   stdin: hook JSON (session_id).
                                                 Just bumps this session's
                                                 heartbeat in `sessions`.
@@ -159,13 +160,11 @@ LIKELY_DEAD_GRACE_MINUTES = 3
 # deprioritize before piling on more, instead of letting the list bloat
 # silently.
 TODO_BLOAT_THRESHOLD = 6
-# SessionStart shows the latest handover from each session that logged one
-# within this window, not just the single latest row repo-wide - multiple
-# parallel agent sessions can each finish and log around the same time, and
-# a "latest overall" query would silently hide every session but the last
-# writer. Bounded so old finished work doesn't pile up in every future
-# SessionStart forever.
-HANDOVER_WINDOW_HOURS = 24
+# SessionStart shows at most this many distinct sessions' latest undelivered
+# handover (current + 1 previous) - not a time window. Combined with the
+# delivered flag, a handover is shown once (to whichever session starts
+# next) and then never replayed again.
+HANDOVER_SHOW_COUNT = 2
 SESSION_NAME_ADJECTIVES = [
     "brave", "calm", "eager", "fuzzy", "gentle", "happy", "jolly", "keen",
     "lively", "mighty", "nimble", "proud", "quiet", "rapid", "sunny",
@@ -187,9 +186,20 @@ def get_conn():
             summary TEXT NOT NULL,
             next_steps TEXT NOT NULL,
             questions TEXT,
-            session_id TEXT NOT NULL
+            session_id TEXT NOT NULL,
+            delivered INTEGER NOT NULL DEFAULT 0
         )"""
     )
+    try:
+        conn.execute("ALTER TABLE handovers ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0")
+        # One-time: don't replay everything logged before this migration existed.
+        # Committed here, not left to the caller - some callers (e.g.
+        # cmd_context_check's no-op path) close the connection without ever
+        # calling commit(), which would silently roll this back.
+        conn.execute("UPDATE handovers SET delivered = 1")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         """CREATE TABLE IF NOT EXISTS context_watch (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -431,28 +441,35 @@ def cmd_init(_args):
     get_conn().close()
 
 
-def recent_handovers(conn, exclude_session_id, window_hours=HANDOVER_WINDOW_HOURS):
-    """Latest handover row from each session (other than exclude_session_id)
-    that logged one within window_hours. Most-recent-session first.
+def recent_handovers(conn, exclude_session_id, limit=HANDOVER_SHOW_COUNT):
+    """Latest undelivered handover from up to `limit` distinct sessions (other
+    than exclude_session_id), most recent first. Marks exactly the returned
+    rows delivered=1, so this same handover never gets shown again.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
     rows = conn.execute(
-        "SELECT session_id, ts, summary, next_steps, questions FROM handovers "
-        "WHERE ts >= ? AND session_id != ? ORDER BY ts",
-        (cutoff, exclude_session_id),
+        "SELECT id, session_id, ts, summary, next_steps, questions FROM handovers "
+        "WHERE delivered = 0 AND session_id != ? ORDER BY ts DESC",
+        (exclude_session_id,),
     ).fetchall()
-    latest = {}
-    for session_id, ts, summary, next_steps, questions in rows:
-        latest[session_id] = (ts, summary, next_steps, questions)  # ascending -> last write wins
-    out = list(latest.items())
-    out.sort(key=lambda row: row[1][0], reverse=True)
+    picked_ids, out, seen_sessions = [], [], set()
+    for row_id, session_id, ts, summary, next_steps, questions in rows:
+        if session_id in seen_sessions:
+            continue
+        seen_sessions.add(session_id)
+        picked_ids.append(row_id)
+        out.append((session_id, (ts, summary, next_steps, questions)))
+        if len(out) >= limit:
+            break
+    if picked_ids:
+        placeholders = ",".join("?" for _ in picked_ids)
+        conn.execute(f"UPDATE handovers SET delivered = 1 WHERE id IN ({placeholders})", picked_ids)
+        conn.commit()
     return out
 
 
 def format_handovers(handovers):
     if not handovers:
-        return "No prior handover found (first session on this repo, or none in the last "\
-            f"{HANDOVER_WINDOW_HOURS}h)."
+        return "No undelivered handover (first session on this repo, or nothing new since the last one)."
     blocks = []
     for session_id, (ts, summary, next_steps, questions) in handovers:
         blocks.append(
