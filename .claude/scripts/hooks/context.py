@@ -108,14 +108,25 @@ def cmd_context_check(_args):
         # UserPromptSubmit. PostToolUse (also wired to this check, see
         # settings.json) silently drops plain text - needs this JSON form
         # or the warning never reaches the model at all.
-        # systemMessage is shown directly to the user in the terminal
-        # (independent of hookSpecificOutput, which only the model sees) -
-        # without it the reminder was easy to miss, buried in hook JSON.
+        # systemMessage is documented to show directly to the user, but
+        # confirmed NOT to render in this user's VSCode extension host (a
+        # soft-threshold fire on 2026-08-21 produced no visible message) -
+        # so additionalContext explicitly instructs the model to relay the
+        # warning itself, which IS guaranteed visible (all of the model's
+        # own text output reaches the user). Keep systemMessage anyway, in
+        # case other host surfaces do render it - redundant, not harmful.
+        relay_instruction = (
+            f"{message}\n"
+            f"(This did not reach the user as a visible message on its own - "
+            f"say this to them, in your own words, in your next visible reply. "
+            f"Fold it into your end-of-turn summary rather than interrupting "
+            f"with a separate message mid-task.)"
+        )
         print(json.dumps({
             "systemMessage": message,
             "hookSpecificOutput": {
                 "hookEventName": hook_event_name,
-                "additionalContext": message,
+                "additionalContext": relay_instruction,
             }
         }))
     except Exception:
