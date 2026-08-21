@@ -45,6 +45,20 @@ Prediction market app. Also carries the standard Claude-collaboration infra
   dead once (clears the guard for good) over repeating
   `--override-session-guard` on every push.
 
+## Repo layout
+
+- `khaldun/` is the app's main folder — the trading agent, its docs, its
+  deps. All app-related files/folders (`khaldun/docs/`, `khaldun/agent.py`,
+  `khaldun/requirements.txt`, ...) nest under it. No loose single files at
+  repo root for app concerns — give it a folder, and put that folder under
+  `khaldun/`.
+- `.claude/` stays separate at root — it's the copy-paste-able dev-collab
+  infra (DB, hooks), not khaldun-specific.
+- True root-level config that tooling expects to find without a path
+  (`CLAUDE.md`, `.gitignore`, `.vscode/`) stays exempt, same pattern as the
+  scripts-by-role rule above.
+
 ## Stack
 
-Not yet decided — no app code exists yet.
+Python (`khaldun/`), Anthropic API. See
+`khaldun/docs/agent-infrastructure-plan.md` for the full architecture.
