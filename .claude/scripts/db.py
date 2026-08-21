@@ -105,6 +105,15 @@ Subcommands:
                                                 only way a handover ever gets
                                                 written - normally invoked
                                                 via the /handover skill.
+  db-snapshot                                  Backup command, not a hook -
+                                                copies state.db into
+                                                db-history/ (a separate
+                                                local-only git repo, no
+                                                remote - see
+                                                lib/db_history.py) and
+                                                commits it there. Run
+                                                manually whenever you want a
+                                                restore point.
   prune [--days N] [--vacuum]                  Delete context_watch rows and
                                                 dead sessions rows older than
                                                 N days (default 30).
@@ -142,6 +151,7 @@ import argparse
 import json
 from datetime import datetime, timedelta, timezone
 
+from cli.db_history import cmd_db_snapshot
 from cli.handovers import cmd_log
 from cli.tasks import cmd_task_add, cmd_task_list, cmd_task_retitle, cmd_task_status
 from hooks.context import cmd_context_check
@@ -184,6 +194,7 @@ def main():
     sub.add_parser("context-check").set_defaults(func=cmd_context_check)
 
     sub.add_parser("task-remind").set_defaults(func=cmd_task_remind)
+    sub.add_parser("db-snapshot").set_defaults(func=cmd_db_snapshot)
 
     session_end_p = sub.add_parser("session-end")
     session_end_p.add_argument(

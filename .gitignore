@@ -1,4 +1,5 @@
 .claude/state.db
+.claude/db-history/
 __pycache__/
 
 # secrets - never track these (see .claude/scripts/git_safe.py SECRET_GLOBS)
