@@ -2,10 +2,18 @@
 CLI entrypoint for state.db (SQLite, gitignored) - session continuity for
 Claude Code hooks/skills in this repo. Stdlib only, no deps.
 
-Table shapes and lifecycle: db_schema.py. Logic lives in domain modules -
-db_sessions.py, db_handovers.py, db_tasks.py, db_context.py - this file only
-wires argparse to them. get_conn and session_activity_note are re-exported
-here because git_safe.py does `import db as state_db` and calls
+This file (and git_safe.py, its sibling) stays at the top of scripts/ on
+purpose - settings.json and the /handover skill reference both by this
+fixed path, so moving them buys nothing but broken references. Everything
+else is organized by who calls it:
+  hooks/   - handlers only ever invoked by a Claude Code hook (settings.json)
+  cli/     - commands only ever invoked manually (task-add, log, ...)
+  lib/     - shared helpers with no command of their own (schema, session
+             heartbeat plumbing, task/handover read helpers) - imported by
+             both hooks/ and cli/, and by git_safe.py's push guard.
+Table shapes and lifecycle: lib/schema.py. This file only wires argparse to
+the handlers above. get_conn and session_activity_note are re-exported here
+because git_safe.py does `import db as state_db` and calls
 `state_db.get_conn()` / `state_db.session_activity_note(...)` directly.
 
 Subcommands:
@@ -15,7 +23,7 @@ Subcommands:
                                                 hookSpecificOutput JSON with
                                                 undelivered handovers (see
                                                 HANDOVER_SHOW_COUNT in
-                                                db_handovers.py).
+                                                lib/handovers.py).
   stop-check                                   stdin: hook JSON (session_id).
                                                 Just bumps this session's
                                                 heartbeat in `sessions`.
@@ -51,7 +59,7 @@ Subcommands:
                                                 prints a soft (100k) then a
                                                 hard (145k) handover-now nudge.
                                                 Never blocks; silent on any
-                                                error. See db_context.py.
+                                                error. See hooks/context.py.
   task-remind                                  PostToolUse hook, matcher
                                                 "TodoWrite" (see settings.json,
                                                 "TodoWrite" is Claude Code's
@@ -134,11 +142,13 @@ import argparse
 import json
 from datetime import datetime, timedelta, timezone
 
-from db_context import cmd_context_check
-from db_handovers import cmd_log
-from db_schema import get_conn
-from db_sessions import cmd_session_end, cmd_session_start, cmd_stop_check, session_activity_note
-from db_tasks import cmd_task_add, cmd_task_list, cmd_task_remind, cmd_task_retitle, cmd_task_status
+from cli.handovers import cmd_log
+from cli.tasks import cmd_task_add, cmd_task_list, cmd_task_retitle, cmd_task_status
+from hooks.context import cmd_context_check
+from hooks.sessions import cmd_session_end, cmd_session_start, cmd_stop_check
+from hooks.task_remind import cmd_task_remind
+from lib.schema import get_conn
+from lib.sessions import session_activity_note
 
 
 def cmd_init(_args):

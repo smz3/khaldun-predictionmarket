@@ -1,20 +1,16 @@
-"""Session lifecycle: heartbeat tracking, staleness reaping, the
-SessionStart/stop-check/session-end hook handlers, and the "other active
-sessions" note used by both SessionStart and git_safe.py's push guard. See
-db_schema.py for the sessions table's shape.
+"""Session lifecycle plumbing shared by hooks/sessions.py and git_safe.py's
+push guard: heartbeat tracking, staleness reaping, and the "other active
+sessions" note. See lib/schema.py for the sessions table's shape.
 """
-import json
 import random
 import subprocess
 from datetime import datetime, timedelta, timezone
 
-from db_handovers import format_handovers, recent_handovers
-from db_schema import get_conn, now, read_stdin_json
-from db_tasks import tasks_note
+from lib.schema import now
 
 STALE_MINUTES = 5
 # Safe at 5 (down from 30) because touch_session now also runs on PostToolUse
-# (see cmd_context_check in db_context.py) - heartbeat has tool-call
+# (see cmd_context_check in hooks/context.py) - heartbeat has tool-call
 # granularity, not just once-per-turn, so a long-running turn keeps
 # refreshing last_seen_ts instead of going quiet until Stop. Was 30
 # specifically to tolerate the old once-per-turn cadence; a real dead
@@ -172,62 +168,3 @@ def session_activity_note(conn, session_id):
             f"heartbeat, not counted above):\n{dead_lines}"
         )
     return note
-
-
-def cmd_session_start(_args):
-    data = read_stdin_json()
-    session_id = data.get("session_id", "")
-    conn = get_conn()
-    activity_note = session_activity_note(conn, session_id)
-    tasks_line = tasks_note(conn)
-    touch_session(conn, session_id)
-    handovers = recent_handovers(conn, session_id)
-    conn.close()
-
-    git_line = git_worktree_summary()
-    handover_block = format_handovers(handovers)
-
-    context = (
-        f"{handover_block}\n\n"
-        f"{git_line}\n"
-        f"{activity_note}\n\n"
-        f"{tasks_line}\n\n"
-        f"This session id: {session_id}\n"
-        f"Before finishing this session, log a handover:\n"
-        f'python .claude/scripts/db.py log --session {session_id} '
-        f'--summary "..." --next "..." [--questions "..."]'
-    )
-
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": context,
-        }
-    }))
-
-
-def cmd_stop_check(_args):
-    data = read_stdin_json()
-    session_id = data.get("session_id", "")
-    conn = get_conn()
-    touch_session(conn, session_id)
-    conn.close()
-    print(json.dumps({"suppressOutput": True}))
-
-
-def cmd_session_end(args):
-    try:
-        session_id = args.session
-        if not session_id:
-            data = read_stdin_json()
-            session_id = data.get("session_id", "")
-        if not session_id:
-            return
-        conn = get_conn()
-        conn.execute("UPDATE sessions SET status = 'dead' WHERE session_id = ?", (session_id,))
-        conn.commit()
-        conn.close()
-        if args.session:
-            print(json.dumps({"session_id": session_id, "status": "dead"}))
-    except Exception:
-        return

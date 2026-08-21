@@ -1,71 +1,14 @@
-"""Tasks table CRUD: the source of truth for cross-session work items. See
-db_schema.py for the table's shape/status-lifecycle/priority-levels.
+"""Manual task-management commands (task-add/task-status/task-retitle/
+task-list). The PostToolUse task-remind nudge is a hook, not a manual
+command - see hooks/task_remind.py. Shared validation/bloat-check helpers
+live in lib/tasks.py (also used by hooks/sessions.py for the SessionStart
+summary).
 """
 import json
 import sys
 
-from db_schema import get_conn, now
-
-# Soft cap, not a hard block: once open+discussing tasks reach this count,
-# task-add/task-status/SessionStart surface a reminder to close/reject/
-# deprioritize before piling on more, instead of letting the list bloat
-# silently.
-TASK_BLOAT_THRESHOLD = 6
-# Hard cap on task_title length (task-add and task-retitle both enforce it).
-# Titles are meant to be scannable in the one-line SessionStart list
-# (tasks_note) - a title that runs long is really a description that
-# belongs in --details instead. Root cause of task #6: #3/#4/#5 had
-# description-length titles because nothing stopped it.
-TASK_TITLE_MAX_LEN = 60
-
-
-def check_task_bloat(conn):
-    """Soft-cap reminder, not a block: nudge once open+discussing tasks reach
-    TASK_BLOAT_THRESHOLD, so the list gets triaged before it grows unreadable.
-    """
-    count = conn.execute(
-        "SELECT COUNT(*) FROM tasks WHERE status IN ('open', 'discussing')"
-    ).fetchone()[0]
-    if count < TASK_BLOAT_THRESHOLD:
-        return None
-    return (
-        f"{count} open/discussing tasks - at or above the soft limit of "
-        f"{TASK_BLOAT_THRESHOLD}. Not a hard block, but close, reject, or "
-        f"deprioritize some before adding more."
-    )
-
-
-def tasks_note(conn):
-    """Every task still open or discussing, for SessionStart - so an item can't
-    silently drop off just because a later handover's prose didn't repeat it.
-    Sorted priority-first, then by id.
-    """
-    rows = conn.execute(
-        "SELECT id, status, priority, category, task_title FROM tasks "
-        "WHERE status IN ('open', 'discussing') ORDER BY priority, id"
-    ).fetchall()
-    if not rows:
-        return "No open or discussing tasks."
-    lines = "\n".join(
-        f"  #{tid} [{status}] P{priority} [{category}] {title}"
-        for tid, status, priority, category, title in rows
-    )
-    note = f"{len(rows)} open/discussing task(s):\n{lines}"
-    bloat = check_task_bloat(conn)
-    if bloat:
-        note = f"[REMINDER] {bloat}\n{note}"
-    return note
-
-
-def validate_task_title(title):
-    if len(title) > TASK_TITLE_MAX_LEN:
-        print(json.dumps({
-            "error": (
-                f"--title is {len(title)} chars, max is {TASK_TITLE_MAX_LEN}. "
-                f"Keep the title short and put the rest in --details."
-            )
-        }))
-        sys.exit(1)
+from lib.schema import get_conn, now
+from lib.tasks import check_task_bloat, validate_task_title
 
 
 def cmd_task_add(args):
@@ -173,18 +116,3 @@ def cmd_task_list(args):
         }
         for r in rows
     ]))
-
-
-def cmd_task_remind(_args):
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "additionalContext": (
-                "[TASK SYNC] If any item just written to the TodoWrite list is a "
-                "durable, cross-session work item (not just a step for the task "
-                "in front of you), mirror it into the persistent backlog now: "
-                "python .claude/scripts/db.py task-add --title T --category "
-                "infra|app --priority 1-4 [--details D]"
-            ),
-        }
-    }))

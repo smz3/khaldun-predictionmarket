@@ -7,7 +7,10 @@ Prediction market app. Also carries the standard Claude-collaboration infra
 
 - `.claude/state.db` (SQLite, gitignored) holds `handovers`, `context_watch`,
   `sessions`, `tasks`. Full schema + rationale: docstring in
-  `.claude/scripts/db.py`.
+  `.claude/scripts/lib/schema.py`. `db.py` is just the CLI entrypoint/router;
+  logic lives under `.claude/scripts/{hooks,cli,lib}/` by who calls it -
+  `hooks/` = only ever invoked by a settings.json hook, `cli/` = only ever
+  invoked manually, `lib/` = shared helpers used by both.
 - SessionStart shows the current + 1 previous undelivered handover, then
   marks them delivered so they don't repeat.
 - `/handover` — wrap up a session: saves work, syncs tasks, logs a handover.

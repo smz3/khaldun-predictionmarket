@@ -1,10 +1,7 @@
-"""Handover CRUD: the free-text "what I did / what's next" note a session
-logs on its way out (normally via the /handover skill). See db_schema.py
-for the table's shape/lifecycle.
+"""Handover read helpers shared with hooks/sessions.py's SessionStart
+handler. Writing a handover (cmd_log) is CLI-only - see cli/handovers.py.
+See lib/schema.py for the handovers table's shape/lifecycle.
 """
-import json
-
-from db_schema import get_conn, now
 
 # SessionStart shows at most this many distinct sessions' latest undelivered
 # handover (current + 1 previous) - not a time window. Combined with the
@@ -51,15 +48,3 @@ def format_handovers(handovers):
             f"Open questions: {questions or ''}"
         )
     return "\n\n".join(blocks)
-
-
-def cmd_log(args):
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO handovers (ts, session_id, summary, next_steps, questions) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (now(), args.session, args.summary, args.next, args.questions or ""),
-    )
-    conn.commit()
-    conn.close()
-    print(json.dumps({"systemMessage": "Handover logged."}))

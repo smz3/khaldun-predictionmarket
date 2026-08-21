@@ -1,11 +1,13 @@
 """Context-window watch: reads real token usage from the transcript and
 fires a one-time soft/hard nudge to log a handover before auto-compact.
+Wired to UserPromptSubmit and PostToolUse in settings.json (see db.py's
+docstring for why both).
 """
 import json
 from pathlib import Path
 
-from db_schema import get_conn, now, read_stdin_json
-from db_sessions import touch_session
+from lib.schema import get_conn, now, read_stdin_json
+from lib.sessions import touch_session
 
 CONTEXT_SOFT = 100_000
 CONTEXT_HARD = 145_000

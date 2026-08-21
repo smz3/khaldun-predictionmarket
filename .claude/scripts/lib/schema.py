@@ -1,13 +1,13 @@
 """
 Schema + connection for state.db (SQLite, gitignored). Stdlib only, no deps.
-Shared by every other db_*.py module - nothing here depends on them.
+Shared by every hooks/cli module - nothing here depends on them.
 
 Table: handovers(id, ts, summary, next_steps, questions, session_id, delivered)
   Plain columns, no JSON - written ONLY on-command (the `log` subcommand,
   normally via the /handover skill), never automatically. A session that
   ends without the user saying "handover" leaves no row here - that's
-  deliberate, not a bug (see cmd_stop_check in db_sessions.py). One row per
-  log call, not one per session - a session can log more than once.
+  deliberate, not a bug (see cmd_stop_check in hooks/sessions.py). One row
+  per log call, not one per session - a session can log more than once.
   SessionStart surfaces the latest row from up to HANDOVER_SHOW_COUNT
   distinct sessions that haven't been delivered yet (delivered=0), most
   recent first, then marks exactly those rows delivered=1 - so a handover
@@ -27,7 +27,7 @@ Table: sessions(name, started_ts, last_seen_ts, status, session_id)
   A session abandoned without SessionEnd firing is caught by
   reap_stale_sessions (called on every heartbeat via touch_session, AND at
   the top of session_activity_note - see STALE_MINUTES /
-  LIKELY_DEAD_GRACE_MINUTES in db_sessions.py), which writes status='dead'
+  LIKELY_DEAD_GRACE_MINUTES in lib/sessions.py), which writes status='dead'
   back to the row itself - not just a display-time filter, so the table is
   trustworthy on its own (e.g. read directly in the SQLite viewer). The
   session_activity_note call matters specifically because git_safe.py's
@@ -59,16 +59,19 @@ Table: tasks(id, status, priority, category, task_title, task_details,
   it. task_details doubles as the running note: status changes append a
   timestamped note there (e.g. why something was rejected) rather than
   overwriting the original description. Sort order everywhere is priority,
-  then id. See TASK_BLOAT_THRESHOLD (db_tasks.py) for the soft-cap reminder
+  then id. See TASK_BLOAT_THRESHOLD (lib/tasks.py) for the soft-cap reminder
   on open+discussing count.
 """
 import json
-import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state.db")
+# This file lives at .claude/scripts/lib/schema.py - parents[2] is .claude,
+# so state.db always resolves next to the .claude directory regardless of
+# which subfolder (lib/hooks/cli) ends up importing it.
+DB_PATH = str(Path(__file__).resolve().parents[2] / "state.db")
 
 
 def get_conn():
