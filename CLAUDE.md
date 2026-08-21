@@ -48,10 +48,17 @@ Prediction market app. Also carries the standard Claude-collaboration infra
 ## Repo layout
 
 - `khaldun/` is the app's main folder — the trading agent, its docs, its
-  deps. All app-related files/folders (`khaldun/docs/`, `khaldun/agent.py`,
-  `khaldun/requirements.txt`, ...) nest under it. No loose single files at
-  repo root for app concerns — give it a folder, and put that folder under
-  `khaldun/`.
+  deps. All app-related files/folders nest under it. No loose single files
+  at repo root for app concerns — give it a folder, and put that folder
+  under `khaldun/`.
+- The same by-role organization applies *inside* `khaldun/` too, same
+  pattern as `.claude/scripts/{hooks,cli,lib}/`: `khaldun/agent/` = the
+  orchestration loop, `khaldun/tools/` = one file per tool/concern that
+  Claude can call (data now, risk/execution later as they're built),
+  registered in `khaldun/tools/__init__.py`. Don't create empty stub
+  folders for layers that don't have code yet (e.g. no `khaldun/state/`
+  until there's a state store to put in it) — add the folder when the
+  first file for that role actually exists.
 - `.claude/` stays separate at root — it's the copy-paste-able dev-collab
   infra (DB, hooks), not khaldun-specific.
 - True root-level config that tooling expects to find without a path
