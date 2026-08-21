@@ -106,7 +106,11 @@ def cmd_context_check(_args):
         # UserPromptSubmit. PostToolUse (also wired to this check, see
         # settings.json) silently drops plain text - needs this JSON form
         # or the warning never reaches the model at all.
+        # systemMessage is shown directly to the user in the terminal
+        # (independent of hookSpecificOutput, which only the model sees) -
+        # without it the reminder was easy to miss, buried in hook JSON.
         print(json.dumps({
+            "systemMessage": message,
             "hookSpecificOutput": {
                 "hookEventName": hook_event_name,
                 "additionalContext": message,
